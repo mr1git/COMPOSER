@@ -1,0 +1,173 @@
+"""Tests for the scalar QSP utilities and Chebyshev plumbing.
+
+* Chebyshev truncation of ``e^{-i alpha x}`` meets the theoretical
+  error bound and converges for increasing degree.
+* The Wx-convention QSP unitary is unitary; symmetric-phase sequences
+  produce polynomials with known parity.
+* The degree-2 ``x -> x^2`` schedule returns Re-part equal to ``x^2``
+  exactly.
+* ``solve_phases_real`` and ``solve_phases_real_chebyshev`` are scalar
+  utilities for parity-valid targets only; the oracle-level use of
+  those phase lists is tested separately in ``test_generator_exp.py``.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from composer.qsp.chebyshev import (
+    cos_alpha_x_coefficients,
+    evaluate_chebyshev,
+    jacobi_anger_coefficients,
+    recommended_degree,
+    sin_alpha_x_coefficients,
+    truncation_error_bound,
+)
+from composer.qsp.phases import (
+    qsp_phase_gate,
+    qsp_polynomial,
+    qsp_signal,
+    qsp_unitary,
+    solve_phases_real,
+    solve_phases_real_chebyshev,
+)
+from composer.qsp.qsvt_poly import x_squared_phases
+
+
+def test_chebyshev_cos_approximation_dense_grid():
+    alpha = 2.3
+    eps = 1e-8
+    d = recommended_degree(alpha, eps)
+    coeffs = cos_alpha_x_coefficients(alpha, d)
+    xs = np.linspace(-1, 1, 501)
+    approx = evaluate_chebyshev(coeffs, xs)
+    exact = np.cos(alpha * xs)
+    assert np.max(np.abs(approx - exact)) < 10 * eps
+
+
+def test_chebyshev_sin_approximation_dense_grid():
+    alpha = 1.7
+    eps = 1e-8
+    d = recommended_degree(alpha, eps)
+    coeffs = sin_alpha_x_coefficients(alpha, d)
+    xs = np.linspace(-1, 1, 501)
+    approx = evaluate_chebyshev(coeffs, xs)
+    exact = np.sin(alpha * xs)
+    assert np.max(np.abs(approx - exact)) < 10 * eps
+
+
+def test_chebyshev_complex_expansion_matches():
+    alpha = 1.3
+    d = recommended_degree(alpha, 1e-10)
+    coeffs = jacobi_anger_coefficients(alpha, d)
+    xs = np.linspace(-1, 1, 301)
+    approx = evaluate_chebyshev(coeffs, xs)
+    exact = np.exp(-1j * alpha * xs)
+    assert np.max(np.abs(approx - exact)) < 1e-9
+
+
+def test_chebyshev_truncation_bound_is_conservative():
+    alpha = 2.0
+    # low-ish degree so the bound is informative
+    d = 15
+    bound = truncation_error_bound(alpha, d)
+    coeffs = jacobi_anger_coefficients(alpha, d)
+    xs = np.linspace(-1, 1, 501)
+    err = np.max(np.abs(evaluate_chebyshev(coeffs, xs) - np.exp(-1j * alpha * xs)))
+    assert err <= bound + 1e-14
+
+
+def test_qsp_signal_unitary():
+    for x in np.linspace(-1, 1, 11):
+        W = qsp_signal(x)
+        assert np.allclose(W @ W.conj().T, np.eye(2), atol=1e-12)
+
+
+def test_qsp_phase_gate_unitary():
+    for phi in [0.0, 0.3, -1.0, 2 * np.pi]:
+        S = qsp_phase_gate(phi)
+        assert np.allclose(S @ S.conj().T, np.eye(2), atol=1e-14)
+
+
+def test_qsp_unitary_is_unitary_random_phases():
+    rng = np.random.default_rng(7)
+    for d in [2, 3, 5, 8]:
+        phases = rng.uniform(-np.pi, np.pi, size=d + 1)
+        for x in [-0.9, -0.3, 0.0, 0.4, 0.99]:
+            U = qsp_unitary(phases, x)
+            assert np.allclose(U @ U.conj().T, np.eye(2), atol=1e-10)
+
+
+def test_qsp_unitary_zero_phases_gives_powers_of_W():
+    # phi_k = 0 everywhere => U = W(x)^d
+    for d in [1, 2, 5]:
+        phases = np.zeros(d + 1)
+        for x in [-0.3, 0.5, 0.8]:
+            U = qsp_unitary(phases, x)
+            W = qsp_signal(x)
+            Wd = np.eye(2, dtype=complex)
+            for _ in range(d):
+                Wd = Wd @ W
+            assert np.allclose(U, Wd, atol=1e-12)
+
+
+def test_x_squared_polynomial_real_part_is_exact():
+    phases = x_squared_phases()
+    xs = np.linspace(-1, 1, 51)
+    for x in xs:
+        P = qsp_polynomial(phases, float(x))
+        assert np.isclose(P.real, x * x, atol=1e-12)
+
+
+def test_x_squared_polynomial_full_value():
+    # P(x) = x^2 - i (1 - x^2), derived in the docstring of qsvt_poly.py.
+    phases = x_squared_phases()
+    xs = np.linspace(-1, 1, 21)
+    for x in xs:
+        P = qsp_polynomial(phases, float(x))
+        expected = x * x - 1j * (1 - x * x)
+        assert np.allclose(P, expected, atol=1e-12)
+
+
+def test_solve_phases_real_recovers_odd_target():
+    # target: 0.5 * x (odd, degree 1, within |P| <= 1)
+    target = np.array([0.0, 0.5], dtype=float)
+    phases, loss = solve_phases_real(target, parity=1, rng_seed=3)
+    xs = np.linspace(-1, 1, 101)
+    approx = np.array([qsp_polynomial(phases, float(x)).real for x in xs])
+    expected = 0.5 * xs
+    assert np.max(np.abs(approx - expected)) < 1e-6, loss
+
+
+def test_solve_phases_real_recovers_even_target():
+    # target: 1 - 2 x^2 = T_2(x), achievable by d=2 phases (non-symmetric in general).
+    target = np.array([1.0, 0.0, -2.0], dtype=float)
+    phases, loss = solve_phases_real(target, parity=0, rng_seed=5, max_iter=5000)
+    xs = np.linspace(-1, 1, 101)
+    approx = np.array([qsp_polynomial(phases, float(x)).real for x in xs])
+    expected = 1.0 - 2.0 * xs * xs
+    # Slightly loose: numerical optimizer may settle at ~1e-5; target is well-posed.
+    assert np.max(np.abs(approx - expected)) < 1e-4, loss
+
+
+def test_solve_phases_real_rejects_wrong_parity_coefficients():
+    target = np.array([0.0, 0.5, 0.1, 0.0], dtype=float)
+    with pytest.raises(ValueError, match="wrong parity"):
+        solve_phases_real(target, parity=1)
+
+
+def test_solve_phases_real_rejects_polynomial_outside_unit_disk():
+    target = np.array([1.2], dtype=float)
+    with pytest.raises(ValueError, match="\\|P\\(x\\)\\| <= 1"):
+        solve_phases_real(target, parity=0)
+
+
+def test_solve_phases_real_chebyshev_recovers_even_cosine_target():
+    alpha = 0.5
+    degree = 8
+    cheb_coeffs = cos_alpha_x_coefficients(alpha, degree)
+    phases, loss = solve_phases_real_chebyshev(cheb_coeffs, parity=0, max_iter=500, n_grid=81)
+    xs = np.linspace(-1, 1, 101)
+    approx = np.array([qsp_polynomial(phases, float(x)).real for x in xs])
+    expected = evaluate_chebyshev(cheb_coeffs, xs).real
+    assert np.max(np.abs(approx - expected)) < 5e-5, loss
