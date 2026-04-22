@@ -24,6 +24,8 @@ from composer.qsp.chebyshev import (
     truncation_error_bound,
 )
 from composer.qsp.phases import (
+    compile_exponential_qsp_schedule,
+    compile_real_chebyshev_phase_sequence,
     qsp_phase_gate,
     qsp_polynomial,
     qsp_signal,
@@ -171,3 +173,50 @@ def test_solve_phases_real_chebyshev_recovers_even_cosine_target():
     approx = np.array([qsp_polynomial(phases, float(x)).real for x in xs])
     expected = evaluate_chebyshev(cheb_coeffs, xs).real
     assert np.max(np.abs(approx - expected)) < 5e-5, loss
+
+
+def test_compile_real_chebyshev_phase_sequence_keeps_chebyshev_target_metadata():
+    alpha = 0.5
+    degree = 8
+    cheb_coeffs = cos_alpha_x_coefficients(alpha, degree)
+    compiled = compile_real_chebyshev_phase_sequence(
+        cheb_coeffs,
+        parity=0,
+        max_iter=500,
+        n_grid=81,
+    )
+
+    assert compiled.target_basis == "chebyshev"
+    assert compiled.degree == degree
+    assert compiled.parity == 0
+    assert np.allclose(compiled.target_coeffs, cheb_coeffs, atol=1e-12)
+
+    xs = np.linspace(-1, 1, 101)
+    approx = np.array([qsp_polynomial(compiled.phases, float(x)).real for x in xs])
+    expected = evaluate_chebyshev(cheb_coeffs, xs).real
+    assert np.max(np.abs(approx - expected)) < 5e-5, compiled.loss
+
+
+def test_compile_exponential_qsp_schedule_tracks_direct_complex_target_and_structured_fallback():
+    alpha = 0.5
+    eps = 5e-2
+    compiled = compile_exponential_qsp_schedule(alpha, eps, n_grid=81, max_iter=500)
+
+    assert compiled.requested_strategy == "auto"
+    assert compiled.resolved_strategy == "parity_split_chebyshev"
+    assert compiled.uses_single_ladder is False
+    assert compiled.cos_sequence.target_basis == "chebyshev"
+    assert compiled.sin_sequence.target_basis == "chebyshev"
+    assert compiled.complex_degree >= 0
+    assert compiled.cos_sequence.degree % 2 == 0
+    assert compiled.sin_sequence.degree % 2 == 1
+
+    xs = np.linspace(-1, 1, 101)
+    complex_target = evaluate_chebyshev(compiled.complex_chebyshev_coeffs, xs)
+    exact = np.exp(-1j * alpha * xs)
+    assert np.max(np.abs(complex_target - exact)) <= compiled.truncation_error_bound + 1e-12
+
+    cos_approx = np.array([qsp_polynomial(compiled.cos_sequence.phases, float(x)).real for x in xs])
+    sin_approx = np.array([qsp_polynomial(compiled.sin_sequence.phases, float(x)).real for x in xs])
+    assert np.max(np.abs(cos_approx - np.cos(alpha * xs))) < 5e-5, compiled.cos_sequence.loss
+    assert np.max(np.abs(sin_approx - np.sin(alpha * xs))) < 5e-5, compiled.sin_sequence.loss

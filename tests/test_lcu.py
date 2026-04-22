@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from composer.block_encoding.lcu import build_hamiltonian_block_encoding
+from composer.circuits.gate import MultiplexedGate, StatePreparationGate
 from composer.operators.hamiltonian import HamiltonianPool, build_pool_from_integrals
 
 
@@ -97,6 +98,33 @@ def test_lcu_resources_match_compiled_circuit_and_branch_accounting():
     assert resources.one_body_branch_count + resources.cholesky_branch_count == len(be.weights)
     assert resources.circuit == be.circuit.resource_summary()
     assert resources.circuit.gate_count_by_kind == {"PREP_H": 2, "SELECT_H": 1}
+    assert resources.circuit.state_preparation_gate_count == 2
+    assert resources.circuit.multiplexed_gate_count == 1
+    assert resources.circuit.composite_gate_count == 3
+    assert isinstance(be.circuit.gates[0], StatePreparationGate)
+    assert isinstance(be.circuit.gates[1], MultiplexedGate)
+    assert isinstance(be.circuit.gates[2], StatePreparationGate)
+
+
+def test_lcu_resource_report_exposes_ancilla_and_selector_overhead():
+    rng = np.random.default_rng(13)
+    n = 3
+    h = 0.1 * rng.normal(size=(n, n))
+    h = 0.5 * (h + h.T)
+    eri = _random_real_symmetric_eri(n, K=2, rng=rng)
+    pool = build_pool_from_integrals(h, eri)
+
+    be = build_hamiltonian_block_encoding(pool)
+    report = be.circuit.resource_report(system_width=be.n_system)
+
+    assert report.compiled.ancilla_qubits == be.n_ancilla
+    assert report.compiled.logical_summary == be.resources.circuit
+    assert report.compiled.selector_control.multiplexed_gate_count == 1
+    assert report.compiled.selector_control.select_gate_count == 0
+    assert report.compiled.selector_control.max_selector_width == be.selector_width
+    assert report.compiled.selector_control.compiled_selector_state_count == 2**be.selector_width
+    assert report.compiled.expanded_gate_count > report.logical.gate_count
+    assert report.compiled.dense_leaf_gate_count > 0
 
 
 def test_lcu_zero_hamiltonian_gives_empty_encoding():

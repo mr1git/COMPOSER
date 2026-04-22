@@ -21,21 +21,33 @@ architecture described in the paper.
   quadratic rank-one operators via an explicit rotated-mode
   PREP/SELECT/occupation-flag construction plus a constant-overhead
   exact degree-2 transform (Lemma 2), and the binary multiplexed LCU of
-  the full rank-one pool (Theorem 1).
+  the full rank-one pool (Theorem 1). The reusable outer LCU skeleton is
+  now represented structurally via synthesized `PREP_*`
+  state-preparation primitives and explicit multiplexed `SELECT_*`
+  dispatch objects rather than only as one dense PREP matrix and one
+  dense block-diagonal SELECT matrix.
 * A real sigma-pool oracle for the compiled generator pool:
   explicit singles channels plus pair-SVD doubles channels on a fixed
   selector register, mask-aware `PREP_sigma`, branch-multiplexed
   `SELECT_sigma`, and an explicit null branch over the compiled pool
-  (Sec IV.B, Eq 39-43).
+  (Sec IV.B, Eq 39-43). Singles still use the exact one-body branch
+  encoding; doubles now use explicit channel-local internal
+  `PREP_pair`/`SELECT_pair` adaptors over canonical pair excitations
+  rather than the old dense full-Fock Hermitian fallback.
 * Scalar QSP utilities plus an oracle-facing generator-exponential
-  construction: parity-resolved QSP ladders for `cos` / `sin` on the
+  construction: a compiled exponential phase schedule rooted in the
+  direct complex Jacobi-Anger target `exp(-i alpha x)`, currently
+  resolved into parity-resolved QSP ladders for `cos` / `sin` on the
   compiled `U_sigma`, explicit block-level Hermitian-part extraction,
-  and a final LCU for `e^{sigma}`. The returned object now keeps these
-  as reusable compiled subcircuits rather than collapsing them into one
-  dense full-width gate; dense matrices are synthesized only in the
-  verification helpers/properties. A dense Chebyshev matrix path is
-  retained only as a numerical reference (Sec IV.B, App C target
-  function).
+  and a final LCU for `e^{sigma}`. The returned object now keeps both
+  the direct complex target metadata and the resolved real-branch
+  subcircuits, rather than issuing two ad hoc trig-specific fits at the
+  generator layer. Dense matrices are synthesized only in the
+  verification helpers/properties. The
+  oblivious-amplitude-amplification stage now also uses explicit
+  ancilla-zero reflection primitives rather than full-width dense
+  reflection matrices. A dense Chebyshev matrix path is retained only
+  as a numerical reference (Sec IV.B, App C target function).
 * The mask-aware similarity sandwich `W_eff = U_sigma^dag W U_sigma`,
   where the returned circuit is now the literal nested compiled-object
   composition `U_sigma^dag W_H U_sigma` built from the real
@@ -52,12 +64,21 @@ architecture described in the paper.
   target `P^(m) e^{-sigma(m)} H e^{sigma(m)} P^(m)`. Compile-once
   verification checks the fixed nested subcircuit structure plus
   mask-dependent PREP re-dialing on that template.
-* Logical resource/accounting summaries derived from the actual
-  compiled objects: Theorem-1 LCU branch counts and selector width,
-  sigma-oracle compiled/active branch counts, generator-exp QSP query
-  counts, and outer-sandwich call counts. These are App-D-style
-  logical summaries tied to the returned circuits/oracles, not
-  fault-tolerant Toffoli/T counts.
+* Layered resource reporting over the actual compiled objects:
+  App-D-style logical summaries on returned oracle objects,
+  recursive compiled-circuit synthesis views via
+  `Circuit.resource_report(...)` / `composer.circuits.resource_report(...)`
+  (ancilla counts, recursive selector/control overhead, dense-leaf
+  counts), and optional backend/export resource views
+  (instruction families, depth, and two-qubit counts when a backend
+  export plus transpilation basis makes those representable). These are
+  still logical / SDK-side views, not fault-tolerant Toffoli/T counts.
+* An optional SDK export adapter layer for compiled COMPOSER circuits.
+  The semantic source of truth remains the repo's own `Circuit` object
+  model and dense verifier; when the optional Qiskit extra is
+  installed, compiled circuits can also be exported for SDK-side
+  transpilation, simulation, and resource inspection without making any
+  quantum SDK mandatory for the base reference workflow.
 * MP2 doubles amplitudes, App-E.3 MP2-weighted cumulative-coverage
   selector masks, and the App-E.2 rank-cumulative wAUC
   subspace-overlap diagnostic.
@@ -73,16 +94,50 @@ where the paper leaves room for interpretation.
 * `numpy >= 1.24`
 * `scipy >= 1.10`
 * `pytest >= 7.0` (for tests)
+* Optional: `qiskit >= 2.4` for SDK export
 
 The supported dev/test environment is a Python `3.10+` virtualenv. If
 your shell exposes the interpreter as `python3` rather than `python`,
 use that executable to create the virtualenv and then use `python`
 inside the activated environment.
 
-No quantum-computing library is required. A tiny dense-matrix
-statevector simulator ships with the package
+No quantum-computing library is required for the reference workflow. A
+tiny dense-matrix statevector simulator ships with the package
 (`src/composer/circuits/simulator.py`) and is used only for numerical
 verification on small systems (up to ~14 qubits).
+
+If you want SDK export, install the optional Qiskit extra:
+
+```bash
+python -m pip install -e '.[qiskit]'
+```
+
+The export layer is an adapter, not a replacement semantic core:
+COMPOSER's own compiled `Circuit` objects remain the reference
+representation, and the Qiskit backend lowers those objects recursively
+for downstream SDK tooling.
+
+## Public Contract
+
+The repo now has a stable three-layer story:
+
+* **Reference semantics**: dense numerical verification on small
+  systems. This is the semantic source of truth for tests and paper
+  traceability.
+* **Scalable synthesized circuits**: returned oracle objects now carry
+  explicit compiled `Circuit` structure rather than one dense outer
+  placeholder. Use `resource_summary()` for top-level logical counts and
+  `resource_report(system_width=...)` for recursive ancilla /
+  selector-control / dense-leaf reporting.
+* **Optional backend/export behavior**: install `'.[qiskit]'` to export
+  compiled circuits and request backend-side resource views such as
+  depth, gate-family histograms, and two-qubit counts when the chosen
+  export/transpilation basis makes those quantities representable.
+
+The dense reference layer is still retained deliberately. A compiled
+path may still contain dense leaf stand-ins for some local primitives;
+the new reports surface those leaves explicitly instead of pretending
+they are already elementary-gate synthesis.
 
 The top-level `composer` package intentionally keeps a narrow surface:
 import concrete functionality from submodules such as
@@ -121,15 +176,55 @@ interpreter run repo-root imports and examples without a manual
 the supported reference workflow remains the editable-install path
 above.
 
+## Optional SDK export
+
+With the optional Qiskit extra installed, compiled circuits can be
+exported through `composer.circuits.export_circuit(...)` or
+`composer.circuits.to_qiskit(...)`. The same layer also supports
+backend-side resource reporting through
+`composer.circuits.resource_report(..., backend="qiskit", ...)`.
+
+```bash
+python -m pip install -e '.[qiskit]'
+python examples/06_qiskit_export_h2.py
+```
+
+Current export contract:
+
+* structural COMPOSER operations (`CircuitCall`, `SelectGate`,
+  `MultiplexedGate`, `AncillaZeroReflectionGate`) are lowered
+  recursively into Qiskit operations rather than flattening the entire
+  COMPOSER circuit into one dense top-level unitary;
+* generic dense leaf `Gate` objects are emitted as native SDK
+  primitives when recognized and otherwise fall back to `UnitaryGate`;
+* `StatePreparationGate` currently exports through its exact COMPOSER
+  verification unitary rather than Qiskit's prepared-state-only
+  primitive, because COMPOSER fixes the full unitary action, not only
+  the `|0...0>` column.
+
+Resource-report contract:
+
+* `Circuit.resource_summary()` remains the concise top-level logical
+  summary tied to the compiled COMPOSER object itself.
+* `Circuit.resource_report(system_width=...)` adds recursive compiled
+  synthesis reporting: ancilla count, recursive gate-family inventory,
+  selector/control-state overhead, and dense-leaf counts.
+* `Circuit.resource_report(..., backend="qiskit", basis_gates=("u", "cx"))`
+  adds a separate backend/export view. This can report transpiled depth
+  and two-qubit counts for the flattened exported circuit, but only
+  because the backend basis makes those quantities concrete. These
+  numbers are SDK-side estimates, not paper claims.
+
 ## Running tests
 
 ```bash
 python -m pytest
 ```
 
-On the validated closure pass (`2026-04-21`), this command completed as
-`173 passed` with no skips, no xfails, and no emitted warnings on
-Python `3.12.13`.
+This is the supported validation command for the reference layer.
+When the optional Qiskit extra is installed, the export checks in
+`tests/test_qiskit_export.py` are also collected as part of the same
+pytest run.
 
 `tests/test_foundation.py` still treats Python `<3.10` as explicitly
 unsupported: the floor check is reported as such instead of failing for
@@ -145,15 +240,11 @@ running account of decisions, verifications and follow-ups.
 
 ## Verification status
 
-Reference validation snapshot (`2026-04-21`, Python `3.12.13`):
-
-* `python -m pytest` -> `173 passed in 744.76s` with no skips, xfails,
-  or warning summary.
-* `python examples/04_lcu_hamiltonian_h2.py` ran cleanly in `0.28s`.
-* `python examples/05_similarity_sandwich.py` ran cleanly in `622.63s`.
-  This example is intentionally verification-scale and is the slowest
-  supported workflow because it includes scalar QSP phase fitting plus
-  dense oracle verification on a synthetic `3 occ / 3 vir` system.
+Reference validation remains centered on `python -m pytest` plus the
+shipped examples. `examples/05_similarity_sandwich.py` is intentionally
+the slowest supported workflow because it includes scalar QSP phase
+fitting plus dense oracle verification on a synthetic `3 occ / 3 vir`
+system.
 
 The pytest suite covers these baseline numerical checks:
 
@@ -167,22 +258,33 @@ The pytest suite covers these baseline numerical checks:
 * **Theorem 1** — `alpha * top_left_block == H_dense` to
   `1e-8`, and the returned object reports branch/selector resource
   counts from the compiled `PREP_H`/`SELECT_H`/`PREP_H^dag` structure
-  (`tests/test_lcu.py`, `tests/test_end_to_end_h2.py`).
+  (`tests/test_lcu.py`, `tests/test_end_to_end_h2.py`). The test path
+  now also locks in that `PREP_H` is a synthesized state-preparation
+  primitive and `SELECT_H` is an explicit compiled multiplexor rather
+  than a dense fallback gate.
 * **Sigma-pool oracle** — the ancilla-zero block of the returned
   `PREP_sigma`/`SELECT_sigma`/`PREP_sigma^dag` oracle equals
   `-i sigma_pool(m) / alpha_bar` for the full compiled singles+doubles
   generator pool, mask updates change only PREP, and the null branch is
   part of the compiled bookkeeping; the returned object also reports
-  selector/branch resource accounting from that compiled oracle
+  selector/branch resource accounting from that compiled oracle. The
+  doubles-side tests now also lock in the internal pair-basis adaptor at
+  the branch level, and the outer sigma-oracle tests lock in structural
+  `PREP_sigma` / `SELECT_sigma` primitives so regressions back to dense
+  branch or dense selector wrappers are caught directly
   (`tests/test_generator_exp.py`, `tests/test_similarity_sandwich.py`).
 * **Generator-exp oracle/QSP path** — the main path now builds
-  `e^{sigma}` from the compiled sigma oracle using parity-split QSP
-  plus LCU, keeps repeated oracle queries and the `cos`/`sin` /
-  final-LCU layers as reusable compiled subcircuits, is checked
-  numerically against `scipy.linalg.expm` on small masked generators
-  including mixed singles+doubles cases, and reports actual compiled
-  `cos`/`sin` QSP query counts
-  (`tests/test_generator_exp.py`).
+  `e^{sigma}` from the compiled sigma oracle using an exponential phase
+  compiler rooted in the direct complex target and resolved, on the
+  current repo scope, into parity-split QSP plus LCU. It keeps repeated
+  oracle queries and the `cos`/`sin` / final-LCU layers as reusable
+  compiled subcircuits, exposes the resolved phase-compilation strategy
+  and complex truncation degree on the returned object/resources, is
+  checked numerically against `scipy.linalg.expm` on small masked
+  generators including mixed singles+doubles cases, and reports actual
+  compiled `cos`/`sin` QSP query counts. The compiled path now also
+  keeps its PREP layers and ancilla-zero reflections as structural
+  primitives (`tests/test_generator_exp.py`).
 * **Dense Chebyshev reference for `exp(sigma)`** — kept only as a dense
   reference and still checked against both `scipy.linalg.expm` and the
   exact truncated polynomial (`tests/test_generator_exp.py`).
@@ -218,6 +320,7 @@ Run the end-to-end demo via
 ```bash
 python examples/04_lcu_hamiltonian_h2.py
 python examples/05_similarity_sandwich.py
+python examples/06_qiskit_export_h2.py  # optional Qiskit layer
 ```
 
 ## Final scope notes
@@ -228,8 +331,13 @@ not an active feature branch. Remaining intentional limitations are:
 * Hamiltonian preprocessing / Theorem-1 support is limited to the
   real-integral electronic-structure case documented in
   [`ASSUMPTIONS.md`](ASSUMPTIONS.md).
-* Generator exponentiation uses parity-split real QSP (`cos` / `sin`
-  plus LCU and one round of oblivious amplitude amplification), not one
-  direct complex phase sequence.
+* Generator exponentiation now compiles phases from the direct complex
+  target `exp(-i alpha x)`, but the resolved ladder synthesis still uses
+  a structured parity split (`cos` / `sin` plus LCU and one round of
+  oblivious amplitude amplification), not one fully direct complex
+  phase list.
 * Resource summaries are logical compiled-object accounting only; the
   repo does not estimate fault-tolerant synthesis costs.
+* Backend/export resource views depend on optional SDK support and on
+  the chosen export/transpilation basis. Depth and two-qubit counts are
+  therefore reported only when that basis makes them concrete.

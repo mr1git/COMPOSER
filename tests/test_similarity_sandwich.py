@@ -11,6 +11,7 @@ from composer.block_encoding.similarity_sandwich import (
     effective_hamiltonian_dense,
 )
 from composer.block_encoding.generator_exp import dense_masked_generator_sigma
+from composer.circuits.gate import AncillaZeroReflectionGate, MultiplexedGate, StatePreparationGate
 from composer.circuits.simulator import unitary as circuit_unitary
 from composer.operators.generator import build_cluster_generator
 from composer.operators.hamiltonian import build_pool_from_integrals
@@ -140,6 +141,11 @@ def test_compile_once_redial_keeps_fixed_compiled_structure_and_allows_only_para
     exp_full = sw_full.generator_exp_oracle
     exp_sparse = sw_sparse.generator_exp_oracle
     exp_frac = sw_frac.generator_exp_oracle
+    assert isinstance(exp_full.sigma_oracle.circuit.gates[0], StatePreparationGate)
+    assert isinstance(exp_full.sigma_oracle.circuit.gates[1], MultiplexedGate)
+    assert isinstance(exp_full.sigma_oracle.circuit.gates[2], StatePreparationGate)
+    assert isinstance(exp_full.unitary_circuit.gates[1], AncillaZeroReflectionGate)
+    assert isinstance(exp_full.unitary_circuit.gates[3], AncillaZeroReflectionGate)
     assert exp_full.circuit.compiled_signature_hash() == exp_sparse.circuit.compiled_signature_hash()
     assert exp_sparse.circuit.compiled_signature_hash() == exp_frac.circuit.compiled_signature_hash()
     assert exp_full.unitary_circuit.compiled_signature_hash() == exp_sparse.unitary_circuit.compiled_signature_hash()
@@ -245,6 +251,24 @@ def test_similarity_sandwich_resources_track_real_compiled_oracles():
     assert resources.circuit == sw.circuit.resource_summary()
     assert resources.circuit.subcircuit_call_count == 3
     assert resources.circuit.gate_count_by_kind == {"U_sigma_oracle": 2, "W_H_oracle": 1}
+
+
+def test_similarity_sandwich_resource_report_recurses_into_nested_oracles():
+    pool, gen = _build_low_ancilla_pool_and_generator(seed=17)
+    mask = uniform_mask(len(gen.generator_channels()))
+    proj = ModelSpaceProjector(determinants=(3, 5, 6, 9, 10, 12))
+
+    sw = build_similarity_sandwich(pool, gen, mask, proj, exp_eps=8e-2, qsp_max_iter=200)
+    report = sw.circuit.resource_report(system_width=sw.resources.n_system)
+
+    assert report.compiled.ancilla_qubits == sw.resources.n_ancilla
+    assert report.compiled.logical_summary == sw.resources.circuit
+    assert report.compiled.selector_control.multiplexed_gate_count >= 2
+    assert report.compiled.selector_control.max_selector_width == max(
+        sw.hamiltonian_oracle.selector_width,
+        sw.generator_exp_oracle.sigma_oracle.selector_width,
+    )
+    assert report.compiled.expanded_gate_count > report.logical.gate_count
 
 
 def test_channel_mask_rejects_negative_weights():

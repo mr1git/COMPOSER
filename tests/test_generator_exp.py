@@ -8,6 +8,7 @@ from scipy.linalg import expm
 
 from composer.block_encoding.generator_exp import (
     build_generator_exp_oracle,
+    build_doubles_channel_adaptor,
     build_sigma_pool_oracle,
     dense_generator_exp_reference,
     dense_masked_generator_sigma,
@@ -16,7 +17,13 @@ from composer.block_encoding.generator_exp import (
     hermitian_fock_block_encoding,
     matrix_chebyshev_eval,
 )
-from composer.circuits.gate import CircuitCall, SelectGate
+from composer.circuits.gate import (
+    AncillaZeroReflectionGate,
+    CircuitCall,
+    MultiplexedGate,
+    SelectGate,
+    StatePreparationGate,
+)
 from composer.circuits.simulator import unitary as circuit_unitary
 from composer.factorization.pair_svd import pair_svd_decompose, reconstruct_t2
 from composer.operators.generator import build_cluster_generator
@@ -167,6 +174,29 @@ def test_cluster_generator_channel_sigmas_sum_to_dense_sigma():
     assert np.allclose(sigma_from_channels, gen.dense_doubles_sigma(), atol=1e-10)
 
 
+def test_doubles_channel_adaptor_matches_channel_sigma_term():
+    rng = np.random.default_rng(131)
+    NO, NV = 2, 3
+    t2 = 0.05 * _random_antisymmetric_t2(NV, NO, rng)
+    gen = build_cluster_generator(NO, NV, t1=None, t2=t2)
+    channel = gen.doubles_channels()[0]
+
+    adaptor = build_doubles_channel_adaptor(channel, n_system=gen.n_orbitals)
+    expected = (-1j * channel.dense_sigma(n_qubits=gen.n_orbitals)) / adaptor.alpha
+
+    assert adaptor.alpha >= channel.sigma
+    assert np.allclose(adaptor.top_left_block_dense, expected, atol=1e-10)
+    assert np.allclose(circuit_unitary(adaptor.circuit), adaptor.unitary, atol=1e-10)
+    assert [g.kind for g in adaptor.circuit.gates] == ["PREP_pair", "SELECT_pair", "PREP_pair"]
+    assert isinstance(adaptor.circuit.gates[0], StatePreparationGate)
+    assert isinstance(adaptor.circuit.gates[1], MultiplexedGate)
+    assert isinstance(adaptor.circuit.gates[2], StatePreparationGate)
+    assert adaptor.selector_width >= 0
+    assert adaptor.active_basis_branch_count >= 1
+    assert adaptor.compiled_basis_branch_count >= adaptor.active_basis_branch_count
+    assert adaptor.circuit.gates[1].num_qubits == gen.n_orbitals + adaptor.n_ancilla
+
+
 def test_cluster_generator_exposes_explicit_singles_channels():
     NO = NV = 2
     t1 = np.array(
@@ -251,6 +281,38 @@ def test_sigma_pool_oracle_top_left_block_matches_masked_full_generator_with_sin
     )
 
 
+def test_sigma_pool_oracle_exposes_explicit_doubles_branch_adaptors():
+    rng = np.random.default_rng(212)
+    NO = NV = 2
+    t1 = np.array(
+        [
+            [0.02 + 0.01j, 0.0],
+            [0.0, -0.015j],
+        ],
+        dtype=complex,
+    )
+    t2 = 0.03 * _random_antisymmetric_t2(NV, NO, rng)
+    gen = build_cluster_generator(NO, NV, t1=t1, t2=t2)
+
+    oracle = build_sigma_pool_oracle(gen, uniform_mask(len(gen.generator_channels())))
+
+    n_singles = len(gen.singles_channels())
+    n_doubles = len(gen.doubles_channels())
+    assert oracle.channel_subencoding_kinds == ("single",) * n_singles + ("double",) * n_doubles
+    assert len(oracle.doubles_branch_adaptors) == n_doubles
+
+    for adaptor, channel in zip(oracle.doubles_branch_adaptors, gen.doubles_channels()):
+        expected = (-1j * channel.dense_sigma(n_qubits=gen.n_orbitals)) / adaptor.alpha
+        assert np.allclose(adaptor.top_left_block_dense, expected, atol=1e-10)
+        assert adaptor.circuit.resource_summary().gate_count_by_kind == {
+            "PREP_pair": 2,
+            "SELECT_pair": 1,
+        }
+        assert adaptor.circuit.resource_summary().state_preparation_gate_count == 2
+        assert adaptor.circuit.resource_summary().multiplexed_gate_count == 1
+        assert adaptor.active_basis_branch_count >= 1
+
+
 def test_sigma_pool_oracle_changes_only_prep_under_mask_update():
     rng = np.random.default_rng(22)
     NO = NV = 3
@@ -262,6 +324,9 @@ def test_sigma_pool_oracle_changes_only_prep_under_mask_update():
     oracle_b = build_sigma_pool_oracle(gen, ChannelMask(weights=0.37 * np.ones(len(channels))))
 
     assert [g.kind for g in oracle_a.circuit.gates] == ["PREP_sigma", "SELECT_sigma", "PREP_sigma"]
+    assert isinstance(oracle_a.circuit.gates[0], StatePreparationGate)
+    assert isinstance(oracle_a.circuit.gates[1], MultiplexedGate)
+    assert isinstance(oracle_a.circuit.gates[2], StatePreparationGate)
     assert oracle_a.circuit.gates[0].num_qubits == oracle_a.selector_width
     assert oracle_a.circuit.gates[1].num_qubits > gen.n_orbitals
     assert np.allclose(oracle_a.circuit.gates[1].matrix, oracle_b.circuit.gates[1].matrix, atol=1e-12)
@@ -287,6 +352,9 @@ def test_sigma_pool_oracle_resources_track_compiled_selector_construction():
     assert resources.null_branch_index == len(channels)
     assert resources.circuit == oracle.circuit.resource_summary()
     assert resources.circuit.gate_count_by_kind == {"PREP_sigma": 2, "SELECT_sigma": 1}
+    assert resources.circuit.state_preparation_gate_count == 2
+    assert resources.circuit.multiplexed_gate_count == 1
+    assert resources.circuit.composite_gate_count == 3
 
 
 def test_sigma_pool_oracle_null_branch_is_compiled_behavior():
@@ -443,6 +511,11 @@ def test_generator_exp_oracle_is_built_from_reusable_compiled_subcircuits():
     sigma_oracle = build_sigma_pool_oracle(gen, mask)
     exp_oracle = build_generator_exp_oracle(sigma_oracle, eps=2e-2, qsp_max_iter=600)
 
+    assert exp_oracle.phase_schedule.resolved_strategy == "parity_split_chebyshev"
+    assert exp_oracle.phase_schedule.uses_single_ladder is False
+    assert np.allclose(exp_oracle.phase_schedule.cos_sequence.phases, exp_oracle.cos_phases, atol=1e-12)
+    assert np.allclose(exp_oracle.phase_schedule.sin_sequence.phases, exp_oracle.sin_phases, atol=1e-12)
+
     assert isinstance(exp_oracle.wx_oracle_circuit.gates[1], CircuitCall)
     assert exp_oracle.wx_oracle_circuit.gates[1].subcircuit is sigma_oracle.circuit
 
@@ -463,9 +536,14 @@ def test_generator_exp_oracle_is_built_from_reusable_compiled_subcircuits():
     assert exp_oracle.sin_oracle_circuit.gates[1].one_circuit.compiled_signature_hash() == exp_oracle.sin_qsp_circuit.inverse().compiled_signature_hash()
 
     assert [g.kind for g in exp_oracle.circuit.gates] == ["PREP_exp", "PHASE_exp", "SELECT_exp", "PREP_exp"]
+    assert isinstance(exp_oracle.circuit.gates[0], StatePreparationGate)
     assert isinstance(exp_oracle.circuit.gates[2], SelectGate)
+    assert isinstance(exp_oracle.circuit.gates[3], StatePreparationGate)
     assert exp_oracle.circuit.gates[2].zero_circuit is exp_oracle.cos_oracle_circuit
     assert exp_oracle.circuit.gates[2].one_circuit is exp_oracle.sin_oracle_circuit
+
+    assert isinstance(exp_oracle.unitary_circuit.gates[1], AncillaZeroReflectionGate)
+    assert isinstance(exp_oracle.unitary_circuit.gates[3], AncillaZeroReflectionGate)
 
 
 def test_generator_exp_oracle_reuses_qsp_phase_lists_across_mask_updates():
@@ -500,6 +578,8 @@ def test_generator_exp_oracle_reuses_qsp_phase_lists_across_mask_updates():
 
     assert exp_a.cos_degree == exp_b.cos_degree
     assert exp_a.sin_degree == exp_b.sin_degree
+    assert exp_a.phase_schedule.complex_degree == exp_b.phase_schedule.complex_degree
+    assert exp_a.phase_schedule.resolved_strategy == exp_b.phase_schedule.resolved_strategy
     assert np.allclose(exp_a.cos_phases, exp_b.cos_phases, atol=1e-12)
     assert np.allclose(exp_a.sin_phases, exp_b.sin_phases, atol=1e-12)
 
@@ -517,6 +597,9 @@ def test_generator_exp_resources_count_actual_qsp_queries():
     assert resources.n_system == gen.n_orbitals
     assert resources.n_ancilla == exp_oracle.n_ancilla
     assert resources.exp_sign == exp_oracle.exp_sign
+    assert resources.phase_compilation_strategy == exp_oracle.phase_schedule.resolved_strategy
+    assert resources.uses_single_ladder is exp_oracle.phase_schedule.uses_single_ladder
+    assert resources.complex_degree == exp_oracle.phase_schedule.complex_degree
     assert resources.cos_degree == exp_oracle.cos_degree
     assert resources.sin_degree == exp_oracle.sin_degree
     assert resources.cos_phase_count == len(exp_oracle.cos_phases)
@@ -530,4 +613,6 @@ def test_generator_exp_resources_count_actual_qsp_queries():
     assert resources.cos_qsp_circuit.subcircuit_call_count == resources.cos_qsp_query_count
     assert resources.sin_qsp_circuit.subcircuit_call_count == resources.sin_qsp_query_count
     assert resources.circuit.select_gate_count == 1
-    assert resources.circuit.composite_gate_count == 1
+    assert resources.circuit.state_preparation_gate_count == 2
+    assert resources.circuit.composite_gate_count == 3
+    assert resources.unitary_circuit.reflection_gate_count == 2

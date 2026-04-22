@@ -18,7 +18,7 @@ import pytest
 
 import composer
 from composer.circuits.circuit import Circuit
-from composer.circuits.gate import Gate
+from composer.circuits.gate import MultiplexedGate, SelectGate, StatePreparationGate, Gate
 from composer.circuits.simulator import statevector, unitary
 from composer.utils import fermion as jw
 from composer.utils.antisymmetric import (
@@ -57,6 +57,19 @@ def _pyproject_value(name: str) -> str:
 def _pyproject_list(name: str) -> list[str]:
     match = re.search(rf"^{name}\s*=\s*\[(.*?)\]", _pyproject_text(), re.MULTILINE | re.DOTALL)
     assert match, f"missing list {name} in pyproject.toml"
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def _optional_dependency_list(extra: str) -> list[str]:
+    section_match = re.search(
+        r"^\[project\.optional-dependencies\]\n(.*?)(?:^\[|\Z)",
+        _pyproject_text(),
+        re.MULTILINE | re.DOTALL,
+    )
+    assert section_match, "missing [project.optional-dependencies] in pyproject.toml"
+    section = section_match.group(1)
+    match = re.search(rf"^{re.escape(extra)}\s*=\s*\[(.*?)\]", section, re.MULTILINE | re.DOTALL)
+    assert match, f"missing optional dependency list {extra!r} in pyproject.toml"
     return re.findall(r'"([^"]+)"', match.group(1))
 
 
@@ -129,9 +142,14 @@ def test_declared_python_floor_is_enforced():
 
 def test_declared_dependencies_cover_runtime_imports():
     runtime_dependencies = {dep.split(">=")[0].split("<")[0].strip() for dep in _pyproject_list("dependencies")}
+    optional_dependencies = {
+        dep.split(">=")[0].split("<")[0].strip()
+        for dep in _optional_dependency_list("qiskit")
+    }
     third_party_imports = _third_party_import_roots()
-    assert third_party_imports <= runtime_dependencies
+    assert third_party_imports <= (runtime_dependencies | optional_dependencies)
     assert runtime_dependencies == {"numpy", "scipy"}
+    assert optional_dependencies == {"qiskit"}
 
 
 def test_pytest_pythonpath_includes_src_checkout():
@@ -438,6 +456,70 @@ def test_circuit_resource_summary_tracks_compiled_gate_inventory():
     assert summary.max_gate_arity == 3
     assert summary.gate_count_by_kind == {"CNOT": 1, "FULL": 1, "H": 1}
     assert summary.compiled_signature_hash == c.compiled_signature_hash()
+
+
+def test_circuit_resource_report_tracks_recursive_selector_and_ancilla_overhead():
+    identity_branch = Circuit(1)
+    identity_branch.append(Gate("I", (0,), np.eye(2, dtype=complex), kind="I"))
+
+    x_branch = Circuit(1)
+    x_branch.append(Gate("X", (0,), _x_gate(), kind="X"))
+
+    c = Circuit(3)
+    c.append(Gate("H", (0,), _h_gate(), kind="H"))
+    c.append(
+        StatePreparationGate(
+            name="PREP",
+            qubits=(1, 2),
+            amplitudes=np.array([1.0, 1.0, 0.0, 0.0], dtype=complex) / np.sqrt(2.0),
+            kind="PREP",
+        )
+    )
+    c.append(
+        SelectGate(
+            name="SELECT",
+            qubits=(0, 1),
+            zero_circuit=identity_branch,
+            one_circuit=x_branch,
+            kind="SELECT",
+        )
+    )
+    c.append(
+        MultiplexedGate(
+            name="MUX",
+            qubits=(0, 1, 2),
+            selector_width=2,
+            branch_circuits=(identity_branch, x_branch),
+            default_circuit=identity_branch,
+            kind="MUX",
+        )
+    )
+
+    report = c.resource_report(system_width=1)
+
+    assert report.logical == c.resource_summary()
+    assert report.compiled.num_qubits == 3
+    assert report.compiled.system_qubits == 1
+    assert report.compiled.ancilla_qubits == 2
+    assert report.compiled.logical_summary == c.resource_summary()
+    assert report.compiled.expanded_gate_count_by_kind == {
+        "H": 1,
+        "I": 3,
+        "MUX": 1,
+        "PREP": 1,
+        "SELECT": 1,
+        "X": 2,
+    }
+    assert report.compiled.dense_leaf_gate_count == 6
+    assert report.compiled.structural_gate_count == 3
+    assert report.compiled.selector_control.select_gate_count == 1
+    assert report.compiled.selector_control.multiplexed_gate_count == 1
+    assert report.compiled.selector_control.compiled_selector_state_count == 6
+    assert report.compiled.selector_control.explicit_branch_count == 4
+    assert report.compiled.selector_control.default_routed_state_count == 2
+    assert report.compiled.selector_control.max_selector_width == 2
+    assert report.compiled.selector_control.max_control_width == 2
+    assert report.compiled.selector_control.selector_width_histogram == {1: 1, 2: 1}
 
 
 # --------------------------------------------------------- linalg helpers

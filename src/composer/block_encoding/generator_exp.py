@@ -18,20 +18,27 @@ The returned ``SigmaOracle`` is the QSP input object for the Hermitian generator
 so its ancilla-zero system block equals ``A / alpha_bar``.
 
 For ``e^{σ̂}``, the main path now consumes that real oracle instead of
-applying a Chebyshev polynomial directly to a dense matrix. Because the
-repo currently has only parity-constrained scalar-QSP synthesis, the
+applying a Chebyshev polynomial directly to a dense matrix. The phase
+compiler is now driven by the direct Appendix-C complex target
+``exp(-i alpha x)`` and only then resolved into the structured fallback
+that the current scalar solver can synthesize. Concretely, the
 implemented exponential is assembled as:
 
-* one QSP sequence for the even real target ``cos(alpha x)``,
-* one QSP sequence for the odd real target ``sin(alpha x)``,
+* one compiled exponential phase schedule rooted in the direct complex
+  Jacobi-Anger series,
+* one QSP sequence for the even real ``cos(alpha x)`` branch,
+* one QSP sequence for the odd real ``sin(alpha x)`` branch,
 * explicit hermitianization of each QSP sequence at the block-encoding
   level, and
 * one final LCU that combines those two real oracles into
   ``cos(-iσ) + i sin(-iσ) = e^{σ}``.
 
-This is materially closer to the paper's oracle/QSP construction than
-the old dense surrogate, while the dense Chebyshev path is retained as
-an optional numerical reference for direct dense-matrix input.
+This keeps the implementation materially closer to the paper's
+oracle/QSP construction than the old dense surrogate, while the dense
+Chebyshev path is retained as an optional numerical reference for
+direct dense-matrix input. A fully direct single complex ladder remains
+deferred; the resolved compilation strategy is tracked explicitly in
+the returned phase schedule.
 """
 from __future__ import annotations
 
@@ -41,19 +48,29 @@ from functools import lru_cache
 import numpy as np
 
 from ..circuits.circuit import Circuit, CircuitResourceSummary
-from ..circuits.gate import CircuitCall, Gate, SelectGate
+from ..circuits.gate import (
+    AncillaZeroReflectionGate,
+    CircuitCall,
+    Gate,
+    MultiplexedGate,
+    SelectGate,
+    StatePreparationGate,
+)
 from ..circuits.simulator import unitary as circuit_unitary
 from ..factorization.pair_svd import EmbeddedPairChannel
 from ..operators.generator import ClusterGenerator, SingleExcitationChannel
 from ..operators.mask import ChannelMask
 from ..qsp.chebyshev import (
-    cos_alpha_x_coefficients,
     jacobi_anger_coefficients,
     recommended_degree,
-    recommended_degree_with_parity,
-    sin_alpha_x_coefficients,
 )
-from ..qsp.phases import qsp_phase_gate, solve_phases_real_chebyshev
+from ..qsp.phases import (
+    CompiledExponentialQSPPhaseSchedule,
+    compile_exponential_qsp_schedule,
+    qsp_phase_gate,
+)
+from ..utils import fermion as jw
+from ..utils.antisymmetric import index_to_pair, pairs_from_matrix
 from .cholesky_channel import hermitian_one_body_block_encoding
 
 __all__ = [
@@ -61,8 +78,10 @@ __all__ = [
     "GeneratorExpResourceSummary",
     "SigmaOracle",
     "GeneratorExpOracle",
+    "DoublesChannelAdaptor",
     "build_sigma_pool_oracle",
     "build_generator_exp_oracle",
+    "build_doubles_channel_adaptor",
     "dense_masked_generator_sigma",
     "dense_masked_doubles_sigma",
     "hermitian_fock_block_encoding",
@@ -94,6 +113,9 @@ class GeneratorExpResourceSummary:
     n_system: int
     n_ancilla: int
     exp_sign: int
+    phase_compilation_strategy: str
+    uses_single_ladder: bool
+    complex_degree: int
     cos_degree: int
     sin_degree: int
     cos_phase_count: int
@@ -105,6 +127,34 @@ class GeneratorExpResourceSummary:
     sin_qsp_circuit: CircuitResourceSummary
     circuit: CircuitResourceSummary
     unitary_circuit: CircuitResourceSummary
+
+
+@dataclass(frozen=True)
+class DoublesChannelAdaptor:
+    """Explicit pair-basis adaptor for one Hermitian doubles sigma branch.
+
+    The branch is synthesized as
+
+        ``PREP_pair^dag SELECT_pair PREP_pair``,
+
+    over the canonical pair-pair excitation basis
+    ``a_a^dag a_b^dag a_j a_i`` internal to the channel. The selector
+    amplitudes are the explicit flattened pair coefficients
+    ``U_ab V_ij^*`` of the rank-one channel, so the doubles branch stays
+    channel-local and operator-level without collapsing back to one
+    dense full-Fock Hermitian fallback.
+    """
+
+    circuit: Circuit = field(repr=False)
+    unitary: np.ndarray = field(repr=False)
+    alpha: float
+    n_system: int
+    n_ancilla: int
+    signal_qubit: int
+    selector_width: int
+    active_basis_branch_count: int
+    compiled_basis_branch_count: int
+    top_left_block_dense: np.ndarray = field(repr=False)
 
 
 @dataclass
@@ -127,6 +177,8 @@ class SigmaOracle:
     prep_branch_weights: np.ndarray
     prep_amplitudes: np.ndarray
     null_branch_index: int
+    channel_subencoding_kinds: tuple[str, ...]
+    doubles_branch_adaptors: tuple[DoublesChannelAdaptor, ...]
     ancilla_zero_block_dense: np.ndarray
     sigma_zero_block_dense: np.ndarray
     resources: SigmaOracleResourceSummary
@@ -140,7 +192,9 @@ class SigmaOracle:
 class GeneratorExpOracle:
     """Oracle/QSP/LCU construction approximating ``e^{sign * σ̂_pool}``.
 
-    ``circuit`` is the direct parity-split block encoding whose
+    ``phase_schedule`` records how the paper's direct complex target was
+    compiled. On the current repo scope it resolves to a structured
+    parity split, so ``circuit`` is the direct parity-split block encoding whose
     ancilla-zero block equals
 
         ``exp(sign * sigma_hat) / 2``.
@@ -164,6 +218,7 @@ class GeneratorExpOracle:
     cos_oracle_circuit: Circuit
     sin_oracle_circuit: Circuit
     unitary_circuit: Circuit
+    phase_schedule: CompiledExponentialQSPPhaseSchedule
     cos_phases: np.ndarray
     sin_phases: np.ndarray
     cos_degree: int
@@ -222,88 +277,215 @@ class GeneratorExpOracle:
         return self._unitary_zero_block_dense
 
 
-def _prep_unitary(weights_abs: np.ndarray, n_ancilla: int) -> np.ndarray:
-    """Dense selector PREP with column-0 equal to the target amplitudes."""
+def _prep_amplitudes(weights_abs: np.ndarray, n_ancilla: int) -> np.ndarray:
+    """Return the padded normalized PREP target amplitudes."""
     dim = 2**n_ancilla
     amps = np.zeros(dim, dtype=complex)
     total = float(np.sum(weights_abs))
     if total <= 0:
         raise ValueError("total PREP weight must be positive")
     amps[: weights_abs.shape[0]] = np.sqrt(weights_abs / total)
-    M = np.zeros((dim, dim), dtype=complex)
-    M[:, 0] = amps
-    for j in range(1, dim):
-        e = np.zeros(dim, dtype=complex)
-        e[j] = 1.0
-        for k in range(j):
-            e = e - np.vdot(M[:, k], e) * M[:, k]
-        nrm = np.linalg.norm(e)
-        if nrm < 1e-12:
-            for j2 in range(dim):
-                cand = np.zeros(dim, dtype=complex)
-                cand[j2] = 1.0
-                for k in range(j):
-                    cand = cand - np.vdot(M[:, k], cand) * M[:, k]
-                cand_nrm = np.linalg.norm(cand)
-                if cand_nrm > 1e-6:
-                    e = cand / cand_nrm
-                    break
-        else:
-            e = e / nrm
-        M[:, j] = e
-    return M
+    return amps
 
 
-def _zero_block_subencoding(n_system: int) -> np.ndarray:
-    """One-ancilla block encoding of the zero operator.
-
-    The paper describes a mask-residual null branch. To preserve the
-    encoded operator while still occupying selector amplitude, the null
-    branch must have zero ancilla-zero block; ``X`` on the signal ancilla
-    is the smallest exact choice.
-    """
-    dim_sys = 2**n_system
-    return np.kron(np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex), np.eye(dim_sys, dtype=complex))
+def _dense_subcircuit(name: str, unitary: np.ndarray, *, width: int, kind: str) -> Circuit:
+    circuit = Circuit(num_qubits=width)
+    circuit.append(Gate(name=name, qubits=tuple(range(width)), matrix=unitary, kind=kind))
+    return circuit
 
 
-def _select_unitary(sub_encodings: list[np.ndarray], n_ancilla: int, n_system: int) -> np.ndarray:
-    """Block-diagonal SELECT over the selector register."""
-    a_sel = n_ancilla - 1
-    sub_dim = 2 ** (n_system + 1)
-    sel_dim = 2**a_sel
-    full_dim = sel_dim * sub_dim
-    default_block = _zero_block_subencoding(n_system)
-    S = np.zeros((full_dim, full_dim), dtype=complex)
-    for s in range(sel_dim):
-        block = sub_encodings[s] if s < len(sub_encodings) else default_block
-        start = s * sub_dim
-        stop = start + sub_dim
-        S[start:stop, start:stop] = block
-    return S
+def _lift_subcircuit(subcircuit: Circuit, *, target_width: int, kind: str) -> Circuit:
+    """Lift ``subcircuit`` onto the low-order qubits of a wider workspace."""
+    if subcircuit.num_qubits > target_width:
+        raise ValueError("target_width must be >= the child subcircuit width")
+    if subcircuit.num_qubits == target_width:
+        return subcircuit
+    circuit = Circuit(num_qubits=target_width)
+    circuit.append(
+        CircuitCall(
+            name=kind,
+            qubits=tuple(range(subcircuit.num_qubits)),
+            subcircuit=subcircuit,
+            kind=kind,
+        )
+    )
+    return circuit
 
 
 def _single_channel_hermitian_subencoding(
     channel: SingleExcitationChannel,
     n_system: int,
-) -> tuple[np.ndarray, float]:
+) -> tuple[Circuit, float]:
     """Full-Fock block encoding of a Hermitian one-body singles generator term."""
-    return hermitian_one_body_block_encoding(
+    W, alpha = hermitian_one_body_block_encoding(
         channel.hermitian_generator_matrix(),
         n_qubits=n_system,
     )
+    return _dense_subcircuit(
+        name="W_sigma_single",
+        unitary=W,
+        width=n_system + 1,
+        kind="W_sigma_single",
+    ), alpha
 
 
-def _channel_hermitian_subencoding(
-    channel: SingleExcitationChannel | EmbeddedPairChannel,
+def _reflection_block_encoding(H: np.ndarray) -> np.ndarray:
+    """Return a one-signal reflection block encoding of a Hermitian contraction."""
+    H = np.asarray(H, dtype=complex)
+    if not np.allclose(H, H.conj().T, atol=1e-10):
+        raise ValueError("H must be Hermitian")
+    eigvals, eigvecs = np.linalg.eigh(H)
+    if np.max(np.abs(eigvals)) > 1.0 + 1e-10:
+        raise ValueError("H must be a contraction")
+    rad = np.sqrt(np.clip(1.0 - eigvals**2, 0.0, 1.0))
+    S = (eigvecs * rad) @ eigvecs.conj().T
+    S = 0.5 * (S + S.conj().T)
+    dim = H.shape[0]
+    W = np.zeros((2 * dim, 2 * dim), dtype=complex)
+    W[:dim, :dim] = H
+    W[:dim, dim:] = S
+    W[dim:, :dim] = S
+    W[dim:, dim:] = -H
+    return W
+
+
+def _zero_branch_subencoding_circuit(n_system: int, branch_ancilla_width: int) -> Circuit:
+    """Zero-operator branch padded to the requested workspace width."""
+    if branch_ancilla_width < 1:
+        raise ValueError("branch workspace must include at least the signal ancilla")
+    circuit = Circuit(num_qubits=n_system + branch_ancilla_width)
+    circuit.append(
+        Gate(
+            name="ZERO_branch_flip",
+            qubits=(n_system,),
+            matrix=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex),
+            kind="ZERO_branch_flip",
+        )
+    )
+    return circuit
+
+
+def build_doubles_channel_adaptor(
+    channel: EmbeddedPairChannel,
+    *,
     n_system: int,
-) -> tuple[np.ndarray, float]:
-    """Exact dense block encoding of ``A_s = -i(L_s - L_s^dag)``."""
-    if isinstance(channel, SingleExcitationChannel):
-        return _single_channel_hermitian_subencoding(channel, n_system=n_system)
-    A_s = -1j * channel.dense_sigma(n_qubits=n_system)
-    A_s = 0.5 * (A_s + A_s.conj().T)
-    return hermitian_fock_block_encoding(A_s)
+    tol: float = 1e-12,
+) -> DoublesChannelAdaptor:
+    """Build the explicit pair-basis doubles branch adaptor.
 
+    This is a channel-local internal LCU over the flattened pair-pair
+    basis. Each internal branch applies the canonical four-orbital
+    Hermitian pair excitation
+
+        ``-i (e^{i phi_abij} a_a^dag a_b^dag a_j a_i - h.c.)``,
+
+    while ``PREP_pair`` carries the rank-one coefficient magnitudes
+    ``|U_ab V_ij^*|``. The resulting ancilla-zero block is exactly
+
+        ``-i (L_s - L_s^dag) / alpha_s``
+
+    with ``alpha_s = sigma_s sum_{ab,ij} |U_ab V_ij^*|``.
+    """
+    if channel.sigma <= 0.0:
+        raise ValueError("doubles channel sigma must be positive")
+
+    u_pairs = pairs_from_matrix(channel.U)
+    v_pairs = pairs_from_matrix(channel.V)
+    n_u = channel.U.shape[0]
+    n_v = channel.V.shape[0]
+
+    active_terms: list[tuple[tuple[int, int], tuple[int, int], complex]] = []
+    weights_abs: list[float] = []
+    for u_idx, u_coef in enumerate(u_pairs):
+        if abs(u_coef) <= tol:
+            continue
+        a_local, b_local = index_to_pair(u_idx, n_u)
+        a_orb = channel.creation_orbitals[a_local]
+        b_orb = channel.creation_orbitals[b_local]
+        for v_idx, v_coef in enumerate(v_pairs):
+            coeff = u_coef * v_coef.conjugate()
+            if abs(coeff) <= tol:
+                continue
+            i_local, j_local = index_to_pair(v_idx, n_v)
+            i_orb = channel.annihilation_orbitals[i_local]
+            j_orb = channel.annihilation_orbitals[j_local]
+            active_terms.append(((i_orb, j_orb), (a_orb, b_orb), coeff))
+            weights_abs.append(float(abs(coeff)))
+    if not active_terms:
+        raise ValueError("doubles channel has no active pair-basis terms")
+
+    selector_width = int(np.ceil(np.log2(len(active_terms)))) if len(active_terms) > 1 else 0
+    branch_alpha = float(channel.sigma * np.sum(weights_abs))
+    signal_qubit = n_system
+    adag = [jw.jw_a_dagger(p, n_system) for p in range(n_system)]
+    a_ = [jw.jw_a(p, n_system) for p in range(n_system)]
+
+    prep_amplitudes = _prep_amplitudes(np.asarray(weights_abs, dtype=float), n_ancilla=selector_width)
+
+    branch_circuits: list[Circuit] = []
+    dim_sys = 1 << n_system
+    for occ_pair, vir_pair, coeff in active_terms:
+        phase = coeff / abs(coeff)
+        L = phase * (adag[vir_pair[0]] @ adag[vir_pair[1]] @ a_[occ_pair[1]] @ a_[occ_pair[0]])
+        A = -1j * (L - L.conj().T)
+        A = 0.5 * (A + A.conj().T)
+        if A.shape != (dim_sys, dim_sys):
+            raise ValueError("unexpected canonical pair branch shape")
+        branch_circuits.append(
+            _dense_subcircuit(
+                name="PAIR_branch_reflection",
+                unitary=_reflection_block_encoding(A),
+                width=n_system + 1,
+                kind="PAIR_branch_reflection",
+            )
+        )
+
+    circuit = Circuit(num_qubits=n_system + 1 + selector_width)
+    selector_qubits = tuple(range(n_system + 1, n_system + 1 + selector_width))
+    full_qubits = tuple(range(n_system + 1 + selector_width))
+    circuit.append(
+        StatePreparationGate(
+            name="PREP_pair",
+            qubits=selector_qubits,
+            amplitudes=prep_amplitudes,
+            kind="PREP_pair",
+        )
+    )
+    circuit.append(
+        MultiplexedGate(
+            name="SELECT_pair",
+            qubits=full_qubits,
+            selector_width=selector_width,
+            branch_circuits=tuple(branch_circuits),
+            default_circuit=_zero_branch_subencoding_circuit(n_system, 1),
+            kind="SELECT_pair",
+        )
+    )
+    circuit.append(
+        StatePreparationGate(
+            name="PREP_pair^dag",
+            qubits=selector_qubits,
+            amplitudes=prep_amplitudes,
+            kind="PREP_pair",
+            adjoint=True,
+        )
+    )
+
+    unitary = circuit_unitary(circuit)
+    dim_sys = 1 << n_system
+    top_left = unitary[:dim_sys, :dim_sys]
+    return DoublesChannelAdaptor(
+        circuit=circuit,
+        unitary=unitary,
+        alpha=branch_alpha,
+        n_system=n_system,
+        n_ancilla=selector_width + 1,
+        signal_qubit=signal_qubit,
+        selector_width=selector_width,
+        active_basis_branch_count=len(active_terms),
+        compiled_basis_branch_count=1 << selector_width if selector_width > 0 else 1,
+        top_left_block_dense=top_left,
+    )
 
 def dense_masked_generator_sigma(
     generator: ClusterGenerator,
@@ -366,15 +548,39 @@ def build_sigma_pool_oracle(
     n = generator.n_orbitals
     dim_sys = 2**n
     ell = len(channels)
-    a_sel = int(np.ceil(np.log2(ell + 1))) if ell + 1 > 1 else 1
-    n_anc = a_sel + 1
 
-    sub_encodings: list[np.ndarray] = []
+    branch_circuits: list[Circuit] = []
+    channel_subencoding_kinds: list[str] = []
+    doubles_branch_adaptors: list[DoublesChannelAdaptor] = []
+    branch_ancilla_widths: list[int] = []
     channel_norms = np.zeros(ell, dtype=float)
     for idx, channel in enumerate(channels):
-        W_s, alpha_s = _channel_hermitian_subencoding(channel, n_system=n)
-        sub_encodings.append(W_s)
+        if isinstance(channel, SingleExcitationChannel):
+            branch_circuit, alpha_s = _single_channel_hermitian_subencoding(channel, n_system=n)
+            channel_subencoding_kinds.append("single")
+            branch_ancilla_widths.append(1)
+        else:
+            adaptor = build_doubles_channel_adaptor(channel, n_system=n, tol=tol)
+            branch_circuit = adaptor.circuit
+            alpha_s = adaptor.alpha
+            channel_subencoding_kinds.append("double")
+            doubles_branch_adaptors.append(adaptor)
+            branch_ancilla_widths.append(adaptor.n_ancilla)
+        branch_circuits.append(branch_circuit)
         channel_norms[idx] = alpha_s
+
+    branch_workspace_width = max(branch_ancilla_widths, default=1)
+    padded_branch_circuits = [
+        _lift_subcircuit(
+            branch_circuit,
+            target_width=n + branch_workspace_width,
+            kind="LIFTED_sigma_branch",
+        )
+        for branch_circuit in branch_circuits
+    ]
+
+    a_sel = int(np.ceil(np.log2(ell + 1))) if ell + 1 > 1 else 1
+    n_anc = a_sel + branch_workspace_width
 
     active_branch_weights = mask.weights * channel_norms
     default_alpha_bar = float(np.sum(channel_norms))
@@ -396,33 +602,41 @@ def build_sigma_pool_oracle(
     prep_branch_weights = np.zeros(ell + 1, dtype=float)
     prep_branch_weights[:ell] = active_branch_weights
     prep_branch_weights[null_branch_index] = residual if ell > 0 or residual > 0 else target_alpha
-    prep_amplitudes = np.zeros(2**a_sel, dtype=float)
-    if target_alpha > 0:
-        prep_amplitudes[: prep_branch_weights.shape[0]] = np.sqrt(prep_branch_weights / target_alpha)
+    prep_amplitudes = _prep_amplitudes(prep_branch_weights, n_ancilla=a_sel)
+    zero_branch_circuit = _zero_branch_subencoding_circuit(n, branch_workspace_width)
 
-    P = _prep_unitary(prep_branch_weights, n_ancilla=a_sel)
-    sub_encodings_with_null = list(sub_encodings)
-    sub_encodings_with_null.append(_zero_block_subencoding(n))
-    S = _select_unitary(sub_encodings_with_null, n_ancilla=n_anc, n_system=n)
-
-    sub_dim = 2 ** (n + 1)
-    P_full = np.kron(P, np.eye(sub_dim, dtype=complex))
-    W_full = P_full.conj().T @ S @ P_full
-    top_left = W_full[:dim_sys, :dim_sys]
-
-    selector_qubits = tuple(range(n + 1, n + 1 + a_sel))
+    selector_qubits = tuple(range(n + branch_workspace_width, n + branch_workspace_width + a_sel))
     full_qubits = tuple(range(n + n_anc))
     circuit = Circuit(num_qubits=n + n_anc)
-    circuit.append(Gate(name="PREP_sigma", qubits=selector_qubits, matrix=P, kind="PREP_sigma"))
     circuit.append(
-        Gate(
+        StatePreparationGate(
+            name="PREP_sigma",
+            qubits=selector_qubits,
+            amplitudes=prep_amplitudes,
+            kind="PREP_sigma",
+        )
+    )
+    circuit.append(
+        MultiplexedGate(
             name="SELECT_sigma",
             qubits=full_qubits,
-            matrix=S,
+            selector_width=a_sel,
+            branch_circuits=tuple(padded_branch_circuits) + (zero_branch_circuit,),
+            default_circuit=zero_branch_circuit,
             kind="SELECT_sigma",
         )
     )
-    circuit.append(Gate(name="PREP_sigma^dag", qubits=selector_qubits, matrix=P.conj().T, kind="PREP_sigma"))
+    circuit.append(
+        StatePreparationGate(
+            name="PREP_sigma^dag",
+            qubits=selector_qubits,
+            amplitudes=prep_amplitudes,
+            kind="PREP_sigma",
+            adjoint=True,
+        )
+    )
+    W_full = circuit_unitary(circuit)
+    top_left = W_full[:dim_sys, :dim_sys]
 
     sigma_block = 1j * top_left
     resources = SigmaOracleResourceSummary(
@@ -447,6 +661,8 @@ def build_sigma_pool_oracle(
         prep_branch_weights=prep_branch_weights,
         prep_amplitudes=prep_amplitudes,
         null_branch_index=null_branch_index,
+        channel_subencoding_kinds=tuple(channel_subencoding_kinds),
+        doubles_branch_adaptors=tuple(doubles_branch_adaptors),
         ancilla_zero_block_dense=top_left,
         sigma_zero_block_dense=sigma_block,
         resources=resources,
@@ -510,8 +726,8 @@ def _qsp_sequence_circuit(
     return circuit
 
 
-def _hadamard() -> np.ndarray:
-    return np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+def _balanced_branch_amplitudes() -> np.ndarray:
+    return np.array([1.0, 1.0], dtype=complex) / np.sqrt(2.0)
 
 
 def _hermitianize_block_encoding(
@@ -521,11 +737,16 @@ def _hermitianize_block_encoding(
     prefix: str,
 ) -> Circuit:
     """Return a block encoding of ``Re(<0|unitary|0>)`` via ``(U + U†)/2``."""
-    H = _hadamard()
-
     anc = n_base_qubits
     circuit = Circuit(num_qubits=n_base_qubits + 1)
-    circuit.append(Gate(name=f"PREP_{prefix}", qubits=(anc,), matrix=H, kind=f"PREP_{prefix}"))
+    circuit.append(
+        StatePreparationGate(
+            name=f"PREP_{prefix}",
+            qubits=(anc,),
+            amplitudes=_balanced_branch_amplitudes(),
+            kind=f"PREP_{prefix}",
+        )
+    )
     circuit.append(
         SelectGate(
             name=f"SELECT_{prefix}",
@@ -536,7 +757,13 @@ def _hermitianize_block_encoding(
         )
     )
     circuit.append(
-        Gate(name=f"PREP_{prefix}^dag", qubits=(anc,), matrix=H.conj().T, kind=f"PREP_{prefix}")
+        StatePreparationGate(
+            name=f"PREP_{prefix}^dag",
+            qubits=(anc,),
+            amplitudes=_balanced_branch_amplitudes(),
+            kind=f"PREP_{prefix}",
+            adjoint=True,
+        )
     )
     return circuit
 
@@ -551,12 +778,18 @@ def _combine_real_exp_components(
     """Final LCU for ``cos(H) + i sign sin(H)`` with ``H = -i sigma``."""
     if exp_sign not in (-1, 1):
         raise ValueError("exp_sign must be +1 or -1")
-    H = _hadamard()
     relative_phase = np.diag([1.0, 1j * exp_sign]).astype(complex)
 
     anc = n_base_qubits
     circuit = Circuit(num_qubits=n_base_qubits + 1)
-    circuit.append(Gate(name="PREP_exp", qubits=(anc,), matrix=H, kind="PREP_exp"))
+    circuit.append(
+        StatePreparationGate(
+            name="PREP_exp",
+            qubits=(anc,),
+            amplitudes=_balanced_branch_amplitudes(),
+            kind="PREP_exp",
+        )
+    )
     circuit.append(Gate(name="PHASE_exp", qubits=(anc,), matrix=relative_phase, kind="PHASE_exp"))
     circuit.append(
         SelectGate(
@@ -567,19 +800,16 @@ def _combine_real_exp_components(
             kind="SELECT_exp",
         )
     )
-    circuit.append(Gate(name="PREP_exp^dag", qubits=(anc,), matrix=H.conj().T, kind="PREP_exp"))
+    circuit.append(
+        StatePreparationGate(
+            name="PREP_exp^dag",
+            qubits=(anc,),
+            amplitudes=_balanced_branch_amplitudes(),
+            kind="PREP_exp",
+            adjoint=True,
+        )
+    )
     return circuit
-
-
-def _ancilla_zero_reflection(n_system: int, n_ancilla: int) -> np.ndarray:
-    """Reflection ``2|0_anc><0_anc| - I`` on the joint ancilla space."""
-    if n_ancilla <= 0:
-        raise ValueError("ancilla-zero reflection requires at least one ancilla qubit")
-    dim_sys = 2**n_system
-    dim_total = 2 ** (n_system + n_ancilla)
-    diag = -np.ones(dim_total, dtype=complex)
-    diag[:dim_sys] = 1.0
-    return np.diag(diag)
 
 
 def _oblivious_amplitude_amplified_unitary(
@@ -601,8 +831,6 @@ def _oblivious_amplitude_amplified_unitary(
     subcircuit rather than collapsing to a dense system gate.
     """
     n_qubits = exp_block_circuit.num_qubits
-    n_ancilla = n_qubits - n_system
-    reflection = _ancilla_zero_reflection(n_system, n_ancilla)
     full_qubits = tuple(range(n_qubits))
 
     circuit = Circuit(num_qubits=n_qubits)
@@ -615,10 +843,10 @@ def _oblivious_amplitude_amplified_unitary(
         )
     )
     circuit.append(
-        Gate(
+        AncillaZeroReflectionGate(
             name="REFLECT_ancilla_zero",
             qubits=full_qubits,
-            matrix=reflection,
+            system_width=n_system,
             kind="REFLECT_ancilla_zero",
         )
     )
@@ -631,10 +859,10 @@ def _oblivious_amplitude_amplified_unitary(
         )
     )
     circuit.append(
-        Gate(
+        AncillaZeroReflectionGate(
             name="REFLECT_ancilla_zero",
             qubits=full_qubits,
-            matrix=reflection,
+            system_width=n_system,
             kind="REFLECT_ancilla_zero",
         )
     )
@@ -658,30 +886,21 @@ def _oblivious_amplitude_amplified_unitary(
 
 
 @lru_cache(maxsize=128)
-def _trig_qsp_phases(
-    kind: str,
+def _compiled_exponential_phase_schedule(
     alpha: float,
-    degree: int,
-    n_grid: int,
+    eps: float,
+    n_grid: int | None,
     max_iter: int,
-) -> tuple[float, ...]:
-    """Cached scalar phase synthesis for the real even/odd trigonometric targets."""
-    if kind == "cos":
-        coeffs = cos_alpha_x_coefficients(alpha, degree)
-        parity = 0
-    elif kind == "sin":
-        coeffs = sin_alpha_x_coefficients(alpha, degree)
-        parity = 1
-    else:
-        raise ValueError("kind must be 'cos' or 'sin'")
-    phases, _ = solve_phases_real_chebyshev(
-        coeffs,
-        parity=parity,
+) -> CompiledExponentialQSPPhaseSchedule:
+    """Cached scalar phase compilation for the exponential target."""
+    return compile_exponential_qsp_schedule(
+        alpha,
+        eps,
+        strategy="auto",
         n_grid=n_grid,
         max_iter=max_iter,
         rng_seed=0,
     )
-    return tuple(float(phi) for phi in phases)
 
 
 def build_generator_exp_oracle(
@@ -720,19 +939,16 @@ def build_generator_exp_oracle(
     signal_qubit = sigma_oracle.n_system
     wx_oracle_circuit = _wx_oracle_circuit(sigma_oracle)
 
-    cos_degree = recommended_degree_with_parity(sigma_oracle.alpha, eps / 2.0, parity=0)
-    sin_degree = recommended_degree_with_parity(sigma_oracle.alpha, eps / 2.0, parity=1)
-    cos_grid = qsp_n_grid or max(81, 8 * cos_degree + 1)
-    sin_grid = qsp_n_grid or max(81, 8 * sin_degree + 1)
-
-    cos_phases = np.array(
-        _trig_qsp_phases("cos", float(sigma_oracle.alpha), cos_degree, cos_grid, qsp_max_iter),
-        dtype=float,
+    phase_schedule = _compiled_exponential_phase_schedule(
+        float(sigma_oracle.alpha),
+        eps,
+        qsp_n_grid,
+        qsp_max_iter,
     )
-    sin_phases = np.array(
-        _trig_qsp_phases("sin", float(sigma_oracle.alpha), sin_degree, sin_grid, qsp_max_iter),
-        dtype=float,
-    )
+    cos_degree = phase_schedule.cos_sequence.degree
+    sin_degree = phase_schedule.sin_sequence.degree
+    cos_phases = phase_schedule.cos_sequence.phases.copy()
+    sin_phases = phase_schedule.sin_sequence.phases.copy()
 
     cos_qsp_circuit = _qsp_sequence_circuit(
         wx_oracle_circuit,
@@ -775,6 +991,9 @@ def build_generator_exp_oracle(
         n_system=sigma_oracle.n_system,
         n_ancilla=sigma_oracle.n_ancilla + 2,
         exp_sign=exp_sign,
+        phase_compilation_strategy=phase_schedule.resolved_strategy,
+        uses_single_ladder=phase_schedule.uses_single_ladder,
+        complex_degree=phase_schedule.complex_degree,
         cos_degree=cos_degree,
         sin_degree=sin_degree,
         cos_phase_count=len(cos_phases),
@@ -799,6 +1018,7 @@ def build_generator_exp_oracle(
         cos_oracle_circuit=cos_oracle_circuit,
         sin_oracle_circuit=sin_oracle_circuit,
         unitary_circuit=unitary_circuit,
+        phase_schedule=phase_schedule,
         cos_phases=cos_phases,
         sin_phases=sin_phases,
         cos_degree=cos_degree,

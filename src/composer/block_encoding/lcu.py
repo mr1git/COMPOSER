@@ -16,10 +16,11 @@ and realize it by PREP-SELECT-PREP\u2020 on a binary selector register
 and the top-left block of ``W`` equals ``H / alpha_H`` restricted to
 the system register (ancilla register projected to ``|0>``).
 
-This module is the small-system verification path. Every weight ``w_s``
-and every sub-encoding ``W_s`` is realized as a dense matrix; the full
-circuit is assembled as a dense unitary and its top-left block is
-compared to ``H`` directly in ``tests/test_lcu.py``.
+This module remains the small-system verification path, but the outer
+LCU scaffold is now represented structurally: ``PREP_H`` is a
+synthesized state-preparation gate and ``SELECT_H`` is an explicit
+multi-branch compiled multiplexor over child branch circuits. The dense
+simulator still verifies the resulting circuit numerically.
 
 Sub-encodings used here
 -----------------------
@@ -47,7 +48,8 @@ from typing import Sequence
 import numpy as np
 
 from ..circuits.circuit import Circuit, CircuitResourceSummary
-from ..circuits.gate import Gate
+from ..circuits.gate import Gate, MultiplexedGate, StatePreparationGate
+from ..circuits.simulator import unitary as circuit_unitary
 from ..operators.hamiltonian import HamiltonianPool
 from ..operators.rank_one import BilinearRankOne
 from .bilinear import build_bilinear_block_encoding
@@ -113,103 +115,57 @@ class LCUBlockEncoding:
         return self.W[:dim_sys, :dim_sys]
 
 
-def _prep_unitary(weights_abs: np.ndarray, n_ancilla: int) -> np.ndarray:
-    """Return a dense unitary ``P`` on ``n_ancilla`` qubits with
-    ``P |0> = sum_s sqrt(w_s / sum_s w_s) |s>``.
-
-    We build the target state-vector, extend to an orthonormal basis via
-    QR (so column 0 equals the amplitude vector), and return the
-    resulting unitary matrix. This is the small-system stand-in for a
-    Moettoenen R_y cascade (ASSUMPTION #9).
-    """
+def _prep_amplitudes(weights_abs: np.ndarray, n_ancilla: int) -> np.ndarray:
+    """Return the padded normalized PREP target amplitudes."""
     dim = 2**n_ancilla
     amps = np.zeros(dim, dtype=complex)
     total = float(np.sum(weights_abs))
     if total <= 0:
         raise ValueError("total weight must be positive")
     amps[: weights_abs.shape[0]] = np.sqrt(weights_abs / total)
-    # QR-extend to unitary whose first column = amps
-    M = np.zeros((dim, dim), dtype=complex)
-    M[:, 0] = amps
-    for j in range(1, dim):
-        e = np.zeros(dim, dtype=complex)
-        e[j] = 1.0
-        for k in range(j):
-            e = e - np.vdot(M[:, k], e) * M[:, k]
-        nrm = np.linalg.norm(e)
-        if nrm < 1e-12:
-            # fallback: try another standard basis index
-            for j2 in range(dim):
-                cand = np.zeros(dim, dtype=complex)
-                cand[j2] = 1.0
-                for k in range(j):
-                    cand = cand - np.vdot(M[:, k], cand) * M[:, k]
-                if np.linalg.norm(cand) > 1e-6:
-                    e = cand / np.linalg.norm(cand)
-                    break
-        else:
-            e = e / nrm
-        M[:, j] = e
-    return M
+    return amps
 
 
-def _select_unitary(
-    sub_encodings: Sequence[np.ndarray],
-    signs: Sequence[int],
-    n_ancilla: int,
-    n_system: int,
-) -> np.ndarray:
-    """Block-diagonal SELECT: branch ``s`` applies ``sgn_s * W_s`` on the
-    system register when the selector register is ``|s>``.
-
-    ``sub_encodings[s]`` is the (2^(1+n) x 2^(1+n)) unitary of the
-    s-th sub-encoding (bilinear/Lemma-2), where the extra qubit is that
-    sub-encoding's private ancilla. Branches with no sub-encoding (null
-    branch, ASSUMPTION #10) are identity.
-
-    The combined register has ``n_ancilla_sel + 1 + n_system`` qubits,
-    with layout (LSB-first): ``[system (n) | sub-ancilla (1) | selector (a_sel)]``.
-    """
-    a_sel = n_ancilla - 1
-    n = n_system
-    sub_dim = 2 ** (n + 1)  # system + sub-ancilla
-    sel_dim = 2**a_sel
-    full_dim = sel_dim * sub_dim
-    S = np.zeros((full_dim, full_dim), dtype=complex)
-    for s in range(sel_dim):
-        block_start = s * sub_dim
-        block_end = block_start + sub_dim
-        if s < len(sub_encodings):
-            W_s = sub_encodings[s]
-            S[block_start:block_end, block_start:block_end] = signs[s] * W_s
-        else:
-            S[block_start:block_end, block_start:block_end] = np.eye(sub_dim, dtype=complex)
-    return S
+def _dense_subcircuit(name: str, unitary: np.ndarray, *, width: int, kind: str) -> Circuit:
+    circuit = Circuit(num_qubits=width)
+    circuit.append(Gate(name=name, qubits=tuple(range(width)), matrix=unitary, kind=kind))
+    return circuit
 
 
-def _bilinear_subencoding(phi: np.ndarray) -> tuple[np.ndarray, float]:
-    """Return the dense (2 * 2^n x 2 * 2^n) Lemma-1 sub-encoding of
+def _identity_circuit(width: int, *, kind: str) -> Circuit:
+    return _dense_subcircuit(
+        name=kind,
+        unitary=np.eye(2**width, dtype=complex),
+        width=width,
+        kind=kind,
+    )
+
+
+def _bilinear_subencoding(phi: np.ndarray) -> tuple[Circuit, float]:
+    """Return the Lemma-1 branch circuit for
     ``a^dag[phi] a[phi]`` (``u = v = phi``, ``coeff = 1``) and the
     sub-encoding normalization (``alpha = 1``).
     """
     L = BilinearRankOne(u=phi, v=phi, coeff=1.0)
     be = build_bilinear_block_encoding(L)
-    from ..circuits.simulator import unitary as circuit_unitary
-
-    W = circuit_unitary(be.circuit)
-    return W, be.alpha
+    return be.circuit, be.alpha
 
 
-def _cholesky_subencoding(L_mu: np.ndarray) -> tuple[np.ndarray, float]:
-    """Return the dense Lemma-2 sub-encoding of ``O_mu^2``.
+def _cholesky_subencoding(L_mu: np.ndarray, *, n_system: int) -> tuple[Circuit, float]:
+    """Return the Lemma-2 branch circuit for ``O_mu^2``.
 
     Returns
     -------
-    W_full : block encoding of ``O_mu^2 / alpha_O^2`` (2*2^n x 2*2^n).
+    W_full : circuit for the block encoding of ``O_mu^2 / alpha_O^2``.
     alpha_O : operator norm of ``O_mu`` on the Fock space.
     """
     W, alpha = hermitian_one_body_block_encoding(L_mu)
-    return x_squared_qsvt_unitary(W), alpha
+    return _dense_subcircuit(
+        name="W_cholesky_squared",
+        unitary=x_squared_qsvt_unitary(W),
+        width=n_system + 1,
+        kind="W_cholesky_squared",
+    ), alpha
 
 
 def build_hamiltonian_block_encoding(pool: HamiltonianPool) -> LCUBlockEncoding:
@@ -227,8 +183,8 @@ def build_hamiltonian_block_encoding(pool: HamiltonianPool) -> LCUBlockEncoding:
     n = pool.n_orbitals
     one_body_channels = pool.one_body_eigendecomposition()
 
-    sub_encs: list[np.ndarray] = []
-    signs: list[int] = []
+    branch_circuits: list[Circuit] = []
+    branch_phases: list[complex] = []
     weights: list[float] = []
     one_body_branch_count = 0
     cholesky_branch_count = 0
@@ -237,9 +193,9 @@ def build_hamiltonian_block_encoding(pool: HamiltonianPool) -> LCUBlockEncoding:
     for ch in one_body_channels:
         if abs(ch.coeff) < 1e-14:
             continue
-        W, _alpha = _bilinear_subencoding(ch.phi)
-        sub_encs.append(W)
-        signs.append(1 if ch.coeff >= 0 else -1)
+        branch_circuit, _alpha = _bilinear_subencoding(ch.phi)
+        branch_circuits.append(branch_circuit)
+        branch_phases.append(1.0 + 0.0j if ch.coeff >= 0 else -1.0 + 0.0j)
         weights.append(abs(ch.coeff))
         one_body_branch_count += 1
 
@@ -257,14 +213,13 @@ def build_hamiltonian_block_encoding(pool: HamiltonianPool) -> LCUBlockEncoding:
                 "Non-Hermitian Cholesky factors (complex integrals) require "
                 "the extended split from App B.2; test path uses real symmetric L_mu."
             )
-        U_mu, alpha_O = _cholesky_subencoding(H_mu)
-        sub_encs.append(U_mu)
-        signs.append(1)
+        branch_circuit, alpha_O = _cholesky_subencoding(H_mu, n_system=n)
+        branch_circuits.append(branch_circuit)
+        branch_phases.append(1.0 + 0.0j)
         weights.append(0.5 * alpha_O * alpha_O)
         cholesky_branch_count += 1
 
     weights_arr = np.array(weights, dtype=float)
-    signs_arr = np.array(signs, dtype=int)
 
     ell = weights_arr.shape[0]
     # Null branch (ASSUMPTION #10): +1 branch so selector width can be fixed.
@@ -279,36 +234,44 @@ def build_hamiltonian_block_encoding(pool: HamiltonianPool) -> LCUBlockEncoding:
     prep_weights[:ell] = weights_arr
     # null slot (index ell) left at 0; remaining slots also 0.
 
-    P = _prep_unitary(prep_weights, n_ancilla=a_sel)
-    S = _select_unitary(sub_encs, signs_arr, n_ancilla=a_sel + 1, n_system=n)
-
     # Total ancilla = sub-ancilla (1) + selector (a_sel).
     n_anc_total = a_sel + 1
     dim_sys = 2**n
-    sub_dim = 2 ** (n + 1)
-    full_dim = 2**a_sel * sub_dim
-
-    # Lift PREP from selector register to full register: P ⊗ I_sub on full.
-    P_full = np.kron(P, np.eye(sub_dim, dtype=complex))
-    # Lift PREP^dag similarly.
-    P_full_dag = P_full.conj().T
-
-    W_full = P_full_dag @ S @ P_full
-
-    # Top-left block: project both sub-ancilla and selector to |0>.
-    # In our layout, sub-ancilla is qubit n, selector is qubits n+1..n+a_sel.
-    # Ancilla = 0 means index 0 in [selector * sub_dim] and 0 in [sub-ancilla * dim_sys].
-    # Full index layout (LSB first): sys (n) | sub-anc (1) | selector (a_sel).
-    # So full_index = sel_val * sub_dim + sub_anc_val * dim_sys + sys_val.
-    # Ancilla-0 block: sel_val=0, sub_anc_val=0 -> indices [0, dim_sys).
-    top_left = W_full[:dim_sys, :dim_sys]
+    prep_amplitudes = _prep_amplitudes(prep_weights, n_ancilla=a_sel)
 
     selector_qubits = tuple(range(n + 1, n + 1 + a_sel))
     full_qubits = tuple(range(n + n_anc_total))
     circuit = Circuit(num_qubits=n + n_anc_total)
-    circuit.append(Gate(name="PREP_H", qubits=selector_qubits, matrix=P, kind="PREP_H"))
-    circuit.append(Gate(name="SELECT_H", qubits=full_qubits, matrix=S, kind="SELECT_H"))
-    circuit.append(Gate(name="PREP_H^dag", qubits=selector_qubits, matrix=P.conj().T, kind="PREP_H"))
+    circuit.append(
+        StatePreparationGate(
+            name="PREP_H",
+            qubits=selector_qubits,
+            amplitudes=prep_amplitudes,
+            kind="PREP_H",
+        )
+    )
+    circuit.append(
+        MultiplexedGate(
+            name="SELECT_H",
+            qubits=full_qubits,
+            selector_width=a_sel,
+            branch_circuits=tuple(branch_circuits) + (_identity_circuit(n + 1, kind="NULL_H_branch"),),
+            default_circuit=_identity_circuit(n + 1, kind="PADDED_H_branch"),
+            branch_phases=tuple(branch_phases) + (1.0 + 0.0j,),
+            kind="SELECT_H",
+        )
+    )
+    circuit.append(
+        StatePreparationGate(
+            name="PREP_H^dag",
+            qubits=selector_qubits,
+            amplitudes=prep_amplitudes,
+            kind="PREP_H",
+            adjoint=True,
+        )
+    )
+    W_full = circuit_unitary(circuit)
+    top_left = W_full[:dim_sys, :dim_sys]
     resources = LCUResourceSummary(
         alpha=alpha_total,
         n_system=n,
@@ -328,7 +291,7 @@ def build_hamiltonian_block_encoding(pool: HamiltonianPool) -> LCUBlockEncoding:
         alpha=alpha_total,
         n_system=n,
         n_ancilla=n_anc_total,
-        weights=weights_arr * signs_arr,
+        weights=weights_arr * np.array([phase.real for phase in branch_phases], dtype=float),
         selector_width=a_sel,
         null_branch_index=null_branch_index,
         circuit=circuit,

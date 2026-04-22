@@ -24,17 +24,19 @@ This module provides scalar forward primitives
 * ``qsp_polynomial(phases, x)``     - extract ``<0|U(x, Phi)|0>``
 * ``qsp_block(phases, x)``          - extract the full 2x2 block (for inspection)
 
-and a numerical phase finder
+and scalar phase-compilation helpers
 
 * ``solve_phases_real(target_coeffs, parity, initial=None, ...)``
-* ``solve_phases_real_chebyshev(target_cheb_coeffs, parity, ...)``
+* ``compile_real_chebyshev_phase_sequence(target_cheb_coeffs, parity, ...)``
+* ``compile_exponential_qsp_schedule(alpha, eps, ...)``
 
-that finds a length-``d+1`` phase sequence whose QSP unitary satisfies
-``Re(<0|U|0>) = target_polynomial(x)`` on ``[-1, 1]`` via L-BFGS-B. This
-is a scalar verification utility for small parity-valid targets. The
-oracle-level QSP/QSVT construction lives separately in
-``block_encoding/generator_exp.py``; it consumes these scalar phase
-lists, but the scalar helpers themselves do not build oracle circuits.
+The direct paper-facing target for generator exponentiation is the
+single complex exponential ``exp(-i alpha x)``. The current repo still
+resolves that target through parity-valid real branches because the
+available scalar phase solver works on real parity-definite targets.
+This module now makes that resolution explicit by compiling a direct
+complex Chebyshev target first and then materializing the structured
+fallback schedule consumed by ``block_encoding/generator_exp.py``.
 
 Anchor the derivation in docstring of
 ``src/composer/qsp/qsvt_poly.py`` for the closed-form ``x -> x^2``
@@ -42,12 +44,27 @@ schedule used by Lemma 2.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.optimize import minimize
 
-from .chebyshev import chebyshev_to_monomial
+from .chebyshev import (
+    chebyshev_to_monomial,
+    cos_alpha_x_coefficients,
+    evaluate_chebyshev,
+    jacobi_anger_coefficients,
+    recommended_degree,
+    recommended_degree_with_parity,
+    sin_alpha_x_coefficients,
+    truncation_error_bound,
+)
 
 __all__ = [
+    "CompiledExponentialQSPPhaseSchedule",
+    "CompiledRealQSPPhaseSequence",
+    "compile_exponential_qsp_schedule",
+    "compile_real_chebyshev_phase_sequence",
     "qsp_signal",
     "qsp_phase_gate",
     "qsp_unitary",
@@ -57,6 +74,43 @@ __all__ = [
     "solve_phases_real",
     "solve_phases_real_chebyshev",
 ]
+
+
+@dataclass(frozen=True)
+class CompiledRealQSPPhaseSequence:
+    """Compiled scalar phase sequence for one real parity-valid target."""
+
+    phases: np.ndarray
+    parity: int
+    degree: int
+    target_basis: str
+    target_coeffs: np.ndarray
+    n_grid: int
+    loss: float
+
+
+@dataclass(frozen=True)
+class CompiledExponentialQSPPhaseSchedule:
+    """Compiled schedule for ``exp(-i alpha x)``.
+
+    ``complex_chebyshev_coeffs`` retains the direct Appendix-C target,
+    while ``cos_sequence`` and ``sin_sequence`` expose the structured
+    parity-split realization used by the current repo.
+    """
+
+    alpha: float
+    eps: float
+    requested_strategy: str
+    resolved_strategy: str
+    complex_degree: int
+    complex_chebyshev_coeffs: np.ndarray
+    truncation_error_bound: float
+    cos_sequence: CompiledRealQSPPhaseSequence
+    sin_sequence: CompiledRealQSPPhaseSequence
+
+    @property
+    def uses_single_ladder(self) -> bool:
+        return False
 
 
 def qsp_signal(x: float) -> np.ndarray:
@@ -131,53 +185,19 @@ def _validate_real_target_polynomial(
         raise ValueError("target polynomial must satisfy |P(x)| <= 1 on [-1, 1]")
 
 
-def solve_phases_real(
-    target_coeffs: np.ndarray,
-    parity: int,
-    initial: np.ndarray | None = None,
-    n_grid: int = 201,
-    tol: float = 1e-10,
-    max_iter: int = 2000,
-    enforce_symmetric: bool = True,
-    rng_seed: int = 0,
+def _solve_real_target_on_grid(
+    target: np.ndarray,
+    *,
+    degree: int,
+    initial: np.ndarray | None,
+    xs: np.ndarray,
+    tol: float,
+    max_iter: int,
+    enforce_symmetric: bool,
+    rng_seed: int,
 ) -> tuple[np.ndarray, float]:
-    """Find phases ``Phi`` such that ``Re(<0|U(x, Phi)|0>) = P_target(x)``.
-
-    Parameters
-    ----------
-    target_coeffs : np.ndarray
-        Monomial-basis real coefficients ``[a_0, a_1, ..., a_d]`` of the
-        target polynomial ``P_target(x) = sum_k a_k x^k``. The polynomial
-        must have definite parity ``d mod 2`` and satisfy
-        ``|P_target(x)| <= 1`` on ``[-1, 1]``.
-    parity : int
-        0 for even, 1 for odd. Consistency-checked against the degree.
-    initial : np.ndarray, optional
-        Initial phase guess; defaults to small random Gaussian perturbation.
-    n_grid : int
-        Number of sample points on ``[-1, 1]`` for the L2 objective.
-    tol, max_iter : float, int
-        scipy.optimize.minimize parameters (``L-BFGS-B``).
-    enforce_symmetric : bool
-        If True, symmetrize the phase sequence every evaluation; this
-        guides the optimizer toward the Wang-Dong-Lin symmetric branch,
-        for which ``P`` is automatically real on ``[-1, 1]``.
-
-    Returns
-    -------
-    phases : np.ndarray, length d + 1
-    final_loss : float
-        Final L2 fit residual squared on the grid (for diagnostic use).
-    """
-    coeffs = np.asarray(target_coeffs, dtype=float).ravel()
-    d = len(coeffs) - 1
-    if parity not in (0, 1):
-        raise ValueError("parity must be 0 or 1")
-    if d % 2 != parity:
-        raise ValueError(f"degree d={d} does not match parity={parity}")
-    xs = np.cos(np.linspace(0, np.pi, n_grid))
-    _validate_real_target_polynomial(coeffs, parity, xs)
-    target = np.polyval(coeffs[::-1], xs)
+    """Solve phases for real target values already sampled on ``xs``."""
+    d = degree
 
     def forward(phases_flat: np.ndarray) -> np.ndarray:
         phi = phases_flat
@@ -201,10 +221,135 @@ def solve_phases_real(
     return phases, float(result.fun)
 
 
+def solve_phases_real(
+    target_coeffs: np.ndarray,
+    parity: int,
+    initial: np.ndarray | None = None,
+    n_grid: int = 201,
+    tol: float = 1e-10,
+    max_iter: int = 2000,
+    enforce_symmetric: bool = True,
+    rng_seed: int = 0,
+) -> tuple[np.ndarray, float]:
+    """Find phases ``Phi`` such that ``Re(<0|U(x, Phi)|0>) = P_target(x)``."""
+    coeffs = np.asarray(target_coeffs, dtype=float).ravel()
+    d = len(coeffs) - 1
+    if parity not in (0, 1):
+        raise ValueError("parity must be 0 or 1")
+    if d % 2 != parity:
+        raise ValueError(f"degree d={d} does not match parity={parity}")
+    xs = np.cos(np.linspace(0, np.pi, n_grid))
+    _validate_real_target_polynomial(coeffs, parity, xs)
+    target = np.polyval(coeffs[::-1], xs)
+    return _solve_real_target_on_grid(
+        target,
+        degree=d,
+        initial=initial,
+        xs=xs,
+        tol=tol,
+        max_iter=max_iter,
+        enforce_symmetric=enforce_symmetric,
+        rng_seed=rng_seed,
+    )
+
+
+def compile_real_chebyshev_phase_sequence(
+    target_cheb_coeffs: np.ndarray,
+    parity: int,
+    initial: np.ndarray | None = None,
+    n_grid: int = 201,
+    tol: float = 1e-10,
+    max_iter: int = 2000,
+    enforce_symmetric: bool = True,
+    rng_seed: int = 0,
+) -> CompiledRealQSPPhaseSequence:
+    """Compile one real parity-valid phase sequence from Chebyshev data."""
+    coeffs = np.asarray(target_cheb_coeffs, dtype=float).ravel()
+    d = len(coeffs) - 1
+    if parity not in (0, 1):
+        raise ValueError("parity must be 0 or 1")
+    if d % 2 != parity:
+        raise ValueError(f"degree d={d} does not match parity={parity}")
+    xs = np.cos(np.linspace(0, np.pi, n_grid))
+    _validate_real_target_polynomial(chebyshev_to_monomial(coeffs), parity, xs)
+    target = evaluate_chebyshev(coeffs, xs).real
+    phases, loss = _solve_real_target_on_grid(
+        target,
+        degree=d,
+        initial=initial,
+        xs=xs,
+        tol=tol,
+        max_iter=max_iter,
+        enforce_symmetric=enforce_symmetric,
+        rng_seed=rng_seed,
+    )
+    return CompiledRealQSPPhaseSequence(
+        phases=phases,
+        parity=parity,
+        degree=d,
+        target_basis="chebyshev",
+        target_coeffs=coeffs,
+        n_grid=n_grid,
+        loss=loss,
+    )
+
+
+def compile_exponential_qsp_schedule(
+    alpha: float,
+    eps: float,
+    *,
+    strategy: str = "auto",
+    n_grid: int | None = None,
+    tol: float = 1e-10,
+    max_iter: int = 2000,
+    enforce_symmetric: bool = True,
+    rng_seed: int = 0,
+) -> CompiledExponentialQSPPhaseSchedule:
+    """Compile the scalar phase schedule for ``exp(-i alpha x)``."""
+    if strategy not in {"auto", "parity_split"}:
+        raise ValueError("strategy must be 'auto' or 'parity_split'")
+    complex_degree = recommended_degree(alpha, eps)
+    complex_coeffs = jacobi_anger_coefficients(alpha, complex_degree)
+    cos_degree = recommended_degree_with_parity(alpha, eps / 2.0, parity=0)
+    sin_degree = recommended_degree_with_parity(alpha, eps / 2.0, parity=1)
+    cos_grid = n_grid or max(81, 8 * cos_degree + 1)
+    sin_grid = n_grid or max(81, 8 * sin_degree + 1)
+    cos_sequence = compile_real_chebyshev_phase_sequence(
+        cos_alpha_x_coefficients(alpha, cos_degree),
+        parity=0,
+        n_grid=cos_grid,
+        tol=tol,
+        max_iter=max_iter,
+        enforce_symmetric=enforce_symmetric,
+        rng_seed=rng_seed,
+    )
+    sin_sequence = compile_real_chebyshev_phase_sequence(
+        sin_alpha_x_coefficients(alpha, sin_degree),
+        parity=1,
+        n_grid=sin_grid,
+        tol=tol,
+        max_iter=max_iter,
+        enforce_symmetric=enforce_symmetric,
+        rng_seed=rng_seed,
+    )
+    return CompiledExponentialQSPPhaseSchedule(
+        alpha=alpha,
+        eps=eps,
+        requested_strategy=strategy,
+        resolved_strategy="parity_split_chebyshev",
+        complex_degree=complex_degree,
+        complex_chebyshev_coeffs=complex_coeffs,
+        truncation_error_bound=truncation_error_bound(alpha, complex_degree),
+        cos_sequence=cos_sequence,
+        sin_sequence=sin_sequence,
+    )
+
+
 def solve_phases_real_chebyshev(
     target_cheb_coeffs: np.ndarray,
     parity: int,
     **kwargs,
 ) -> tuple[np.ndarray, float]:
     """Solve scalar-QSP phases for a real target given in Chebyshev basis."""
-    return solve_phases_real(chebyshev_to_monomial(target_cheb_coeffs), parity=parity, **kwargs)
+    compiled = compile_real_chebyshev_phase_sequence(target_cheb_coeffs, parity=parity, **kwargs)
+    return compiled.phases, compiled.loss

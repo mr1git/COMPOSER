@@ -16,11 +16,14 @@ The truncation degree follows ASSUMPTION #7
 which is sufficient for a uniform truncation error ``eps`` on ``[-1, 1]``
 (standard Jacobi-Anger bound; see Appendix C.2 of the paper).
 
-Used by ``block_encoding/generator_exp.py`` as the scalar source for
-the parity-valid ``cos(alpha x)`` / ``sin(alpha x)`` phase targets in
-the oracle-facing generator-exponential path. The retained dense
-Chebyshev evaluation is a reference helper only; it is not the main
-construction path for ``build_generator_exp_oracle(...)``.
+Used by ``qsp/phases.py`` and ``block_encoding/generator_exp.py`` as
+the scalar source for the generator-exponential phase compiler. The
+compiler now anchors itself to the direct complex Jacobi-Anger target
+``exp(-i alpha x)`` and then, on the current repo scope, resolves that
+target into the parity-valid ``cos(alpha x)`` / ``sin(alpha x)``
+branches that the scalar phase solver can synthesize. The retained
+dense Chebyshev evaluation is a reference helper only; it is not the
+main construction path for ``build_generator_exp_oracle(...)``.
 """
 from __future__ import annotations
 

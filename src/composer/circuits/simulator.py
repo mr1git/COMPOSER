@@ -7,9 +7,10 @@ then compares top-left blocks or explicit amplitudes against hand-built
 second-quantized references.
 
 The construction path elsewhere in the repo may now retain hierarchical
-subcircuit calls and branch-select objects. This simulator remains the
+subcircuit calls, synthesized state-preparation gates, selector
+multiplexors, and ancilla reflections. This simulator remains the
 verification backend: when such composite operations are encountered,
-their dense matrices are synthesized lazily only here.
+their dense action is synthesized lazily only here.
 
 Conventions
 -----------
@@ -35,7 +36,7 @@ from __future__ import annotations
 import numpy as np
 
 from .circuit import Circuit
-from .gate import CircuitOp
+from .gate import AncillaZeroReflectionGate, CircuitOp
 
 __all__ = [
     "apply_gate_to_statevector",
@@ -74,6 +75,15 @@ def apply_gate_to_statevector(state: np.ndarray, gate: CircuitOp, n_qubits: int)
     """Apply a gate to a 2**n statevector; returns the new statevector."""
     if state.shape != (2**n_qubits,):
         raise ValueError(f"statevector shape {state.shape} != (2**{n_qubits},)")
+    if isinstance(gate, AncillaZeroReflectionGate):
+        psi = _state_to_tensor(state, n_qubits)
+        reflected = -psi.copy()
+        ancilla_qubits = gate.qubits[gate.system_width :]
+        zero_slice: list[slice | int] = [slice(None)] * n_qubits
+        for q in ancilla_qubits:
+            zero_slice[q] = 0
+        reflected[tuple(zero_slice)] *= -1.0
+        return _tensor_to_state(reflected, n_qubits)
     k = gate.num_qubits
     G = _gate_to_tensor(gate.matrix, k)
     psi = _state_to_tensor(state, n_qubits)
@@ -127,7 +137,7 @@ def unitary(circuit: Circuit) -> np.ndarray:
     return u
 
 
-def embed_gate(gate: Gate, n_qubits: int) -> np.ndarray:
+def embed_gate(gate: CircuitOp, n_qubits: int) -> np.ndarray:
     """Return the 2**n x 2**n embedding of ``gate``, identity elsewhere."""
     c = Circuit(num_qubits=n_qubits)
     c.append(gate)

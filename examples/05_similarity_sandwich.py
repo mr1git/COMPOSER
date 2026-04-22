@@ -20,6 +20,7 @@ from composer.block_encoding.similarity_sandwich import (
     ModelSpaceProjector,
     build_similarity_sandwich,
 )
+from composer.circuits import resource_report
 from composer.diagnostics.mask_selection import channel_weights_mp2, cumulative_coverage_mask
 from composer.diagnostics.mp2 import mp2_doubles_amplitudes
 from composer.diagnostics.subspace import wauc
@@ -62,6 +63,7 @@ def main() -> None:
     proj = ModelSpaceProjector(determinants=_n_electron_determinants(n, NO))
     sw_compiled = build_similarity_sandwich(pool, gen, mask_full, proj, exp_eps=8e-2, qsp_max_iter=400)
     sw_selected = sw_compiled.redial_mask(mask_selected)
+    compiled_report = resource_report(sw_compiled.circuit, system_width=sw_compiled.resources.n_system)
     P = proj.dense_matrix(n)
     nested_projected_compiled = P @ (sw_compiled.alpha * sw_compiled.encoded_system_block_dense) @ P
     nested_projected_selected = P @ (sw_selected.alpha * sw_selected.encoded_system_block_dense) @ P
@@ -103,6 +105,13 @@ def main() -> None:
         f"U_sigma calls={sw_compiled.resources.u_sigma_call_count}, "
         f"projector rank={sw_compiled.resources.projector_rank}, "
         f"gate inventory={sw_compiled.resources.circuit.gate_count_by_kind}"
+    )
+    print(
+        "Nested compiled synthesis view: "
+        f"ancilla={compiled_report.compiled.ancilla_qubits}, "
+        f"expanded gate kinds={compiled_report.compiled.expanded_gate_count_by_kind}, "
+        f"selector states={compiled_report.compiled.selector_control.compiled_selector_state_count}, "
+        f"max selector width={compiled_report.compiled.selector_control.max_selector_width}"
     )
     print(
         "Outer circuit uses nested subcircuits only: "

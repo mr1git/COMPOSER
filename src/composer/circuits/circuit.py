@@ -28,6 +28,9 @@ class CircuitResourceSummary:
     composite_gate_count: int
     subcircuit_call_count: int
     select_gate_count: int
+    state_preparation_gate_count: int
+    multiplexed_gate_count: int
+    reflection_gate_count: int
     max_gate_arity: int
     gate_count_by_kind: dict[str, int]
     compiled_signature_hash: str
@@ -150,11 +153,22 @@ class Circuit:
             full_width_gate_count=sum(g.num_qubits == self.num_qubits for g in self.gates),
             composite_gate_count=sum(g.implementation_tag() != "dense" for g in self.gates),
             subcircuit_call_count=sum(g.implementation_tag() == "subcircuit" for g in self.gates),
-            select_gate_count=sum(g.implementation_tag() == "select" for g in self.gates),
+            select_gate_count=sum(g.implementation_tag() in {"select", "multiplexed"} for g in self.gates),
+            state_preparation_gate_count=sum(
+                g.implementation_tag() == "state_prep" for g in self.gates
+            ),
+            multiplexed_gate_count=sum(g.implementation_tag() == "multiplexed" for g in self.gates),
+            reflection_gate_count=sum(g.implementation_tag() == "reflection" for g in self.gates),
             max_gate_arity=max_arity,
             gate_count_by_kind=dict(sorted(kind_counts.items())),
             compiled_signature_hash=self.compiled_signature_hash(),
         )
+
+    def resource_report(self, **kwargs):
+        """Return compiled and optional backend resource-estimation views."""
+        from .resources import resource_report
+
+        return resource_report(self, **kwargs)
 
     def __len__(self) -> int:
         return len(self.gates)

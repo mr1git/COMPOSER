@@ -17,6 +17,7 @@ if str(REPO_SRC) not in sys.path:
     sys.path.insert(0, str(REPO_SRC))
 
 from composer.block_encoding.lcu import build_hamiltonian_block_encoding
+from composer.circuits import resource_report
 from composer.operators.hamiltonian import build_pool_from_integrals
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "h2_sto3g_integrals.npz")
@@ -35,6 +36,7 @@ def main() -> None:
           f"Cholesky rank {pool.cholesky_factors.shape[0]}")
 
     be = build_hamiltonian_block_encoding(pool)
+    compiled_report = resource_report(be.circuit, system_width=be.n_system)
     print(f"Theorem-1 block encoding: alpha = {be.alpha:.6f}, "
           f"selector width = {be.n_ancilla} qubits, "
           f"{be.W.shape[0]} x {be.W.shape[1]} unitary")
@@ -45,6 +47,14 @@ def main() -> None:
         f"Cholesky={be.resources.cholesky_branch_count}), "
         f"compiled selector branches={be.resources.compiled_branch_count}, "
         f"gate inventory={be.resources.circuit.gate_count_by_kind}"
+    )
+    print(
+        "Compiled synthesis view: "
+        f"system={compiled_report.compiled.system_qubits}, "
+        f"ancilla={compiled_report.compiled.ancilla_qubits}, "
+        f"dense leaves={compiled_report.compiled.dense_leaf_gate_count}, "
+        f"selector states={compiled_report.compiled.selector_control.compiled_selector_state_count}, "
+        f"max selector width={compiled_report.compiled.selector_control.max_selector_width}"
     )
 
     # Verify the block encoding reproduces the dense Hamiltonian.
