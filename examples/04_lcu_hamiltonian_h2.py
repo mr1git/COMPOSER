@@ -37,9 +37,10 @@ def main() -> None:
 
     be = build_hamiltonian_block_encoding(pool)
     compiled_report = resource_report(be.circuit, system_width=be.n_system)
+    total_width = be.n_system + be.n_ancilla
     print(f"Theorem-1 block encoding: alpha = {be.alpha:.6f}, "
-          f"selector width = {be.n_ancilla} qubits, "
-          f"{be.W.shape[0]} x {be.W.shape[1]} unitary")
+          f"compiled ancilla width = {be.n_ancilla} qubits, "
+          f"dense full unitary available lazily on {total_width} qubits")
     print(
         "Compiled LCU resources: "
         f"branches={be.resources.active_branch_count} "
@@ -53,6 +54,7 @@ def main() -> None:
         f"system={compiled_report.compiled.system_qubits}, "
         f"ancilla={compiled_report.compiled.ancilla_qubits}, "
         f"dense leaves={compiled_report.compiled.dense_leaf_gate_count}, "
+        f"dense leaf kinds={compiled_report.compiled.dense_leaf_gate_count_by_kind}, "
         f"selector states={compiled_report.compiled.selector_control.compiled_selector_state_count}, "
         f"max selector width={compiled_report.compiled.selector_control.max_selector_width}"
     )

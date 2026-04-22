@@ -16,9 +16,12 @@ import numpy as np
 import pytest
 
 from composer.qsp.chebyshev import (
+    chebyshev_parity,
     cos_alpha_x_coefficients,
     evaluate_chebyshev,
     jacobi_anger_coefficients,
+    split_chebyshev_by_parity,
+    split_exponential_chebyshev_components,
     recommended_degree,
     sin_alpha_x_coefficients,
     truncation_error_bound,
@@ -98,6 +101,17 @@ def test_qsp_unitary_is_unitary_random_phases():
         for x in [-0.9, -0.3, 0.0, 0.4, 0.99]:
             U = qsp_unitary(phases, x)
             assert np.allclose(U @ U.conj().T, np.eye(2), atol=1e-10)
+
+
+def test_wx_qsp_polynomial_has_definite_parity_for_arbitrary_phases():
+    rng = np.random.default_rng(17)
+    for d in [1, 2, 5, 8]:
+        phases = rng.uniform(-np.pi, np.pi, size=d + 1)
+        xs = np.linspace(-1, 1, 4 * (d + 1) + 1)
+        ys = np.array([qsp_polynomial(phases, float(x)) for x in xs])
+        coeffs = np.polynomial.polynomial.polyfit(xs, ys, d)
+        wrong_parity = coeffs[1 - (d % 2) :: 2]
+        assert np.max(np.abs(wrong_parity), initial=0.0) < 1e-8
 
 
 def test_qsp_unitary_zero_phases_gives_powers_of_W():
@@ -200,16 +214,27 @@ def test_compile_real_chebyshev_phase_sequence_keeps_chebyshev_target_metadata()
 def test_compile_exponential_qsp_schedule_tracks_direct_complex_target_and_structured_fallback():
     alpha = 0.5
     eps = 5e-2
-    compiled = compile_exponential_qsp_schedule(alpha, eps, n_grid=81, max_iter=500)
+    compiled = compile_exponential_qsp_schedule(
+        alpha,
+        eps,
+        strategy="direct_complex",
+        n_grid=81,
+        max_iter=500,
+    )
 
-    assert compiled.requested_strategy == "auto"
-    assert compiled.resolved_strategy == "parity_split_chebyshev"
+    assert compiled.requested_strategy == "direct_complex"
+    assert compiled.resolved_strategy == "parity_split_due_mixed_parity"
     assert compiled.uses_single_ladder is False
+    assert compiled.direct_complex_supported is False
+    assert compiled.direct_sequence is None
+    assert compiled.fallback_reason is not None
+    assert "definite parity" in compiled.fallback_reason
     assert compiled.cos_sequence.target_basis == "chebyshev"
     assert compiled.sin_sequence.target_basis == "chebyshev"
     assert compiled.complex_degree >= 0
     assert compiled.cos_sequence.degree % 2 == 0
     assert compiled.sin_sequence.degree % 2 == 1
+    assert chebyshev_parity(compiled.complex_chebyshev_coeffs) is None
 
     xs = np.linspace(-1, 1, 101)
     complex_target = evaluate_chebyshev(compiled.complex_chebyshev_coeffs, xs)
@@ -220,3 +245,17 @@ def test_compile_exponential_qsp_schedule_tracks_direct_complex_target_and_struc
     sin_approx = np.array([qsp_polynomial(compiled.sin_sequence.phases, float(x)).real for x in xs])
     assert np.max(np.abs(cos_approx - np.cos(alpha * xs))) < 5e-5, compiled.cos_sequence.loss
     assert np.max(np.abs(sin_approx - np.sin(alpha * xs))) < 5e-5, compiled.sin_sequence.loss
+
+
+def test_exponential_fallback_branches_are_derived_from_direct_complex_coefficients():
+    alpha = 0.5
+    eps = 5e-2
+    compiled = compile_exponential_qsp_schedule(alpha, eps, strategy="direct_complex", n_grid=81, max_iter=500)
+
+    even, odd = split_chebyshev_by_parity(compiled.complex_chebyshev_coeffs)
+    cos_coeffs, sin_coeffs = split_exponential_chebyshev_components(compiled.complex_chebyshev_coeffs)
+
+    assert np.allclose(compiled.complex_even_chebyshev_coeffs, even, atol=1e-12)
+    assert np.allclose(compiled.complex_odd_chebyshev_coeffs, odd, atol=1e-12)
+    assert np.allclose(compiled.cos_sequence.target_coeffs, cos_coeffs, atol=1e-12)
+    assert np.allclose(compiled.sin_sequence.target_coeffs, sin_coeffs, atol=1e-12)

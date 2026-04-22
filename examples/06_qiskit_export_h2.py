@@ -58,7 +58,8 @@ def main() -> None:
         "Compiled synthesis view: "
         f"ancilla={report.compiled.ancilla_qubits}, "
         f"selector states={report.compiled.selector_control.compiled_selector_state_count}, "
-        f"dense leaves={report.compiled.dense_leaf_gate_count}"
+        f"dense leaves={report.compiled.dense_leaf_gate_count}, "
+        f"dense leaf kinds={report.compiled.dense_leaf_gate_count_by_kind}"
     )
     print(f"Top-level instruction count: {len(exported.data)}")
     print(f"Top-level op histogram: {dict(exported.count_ops())}")

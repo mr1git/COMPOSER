@@ -5,10 +5,13 @@ import numpy as np
 
 from composer.block_encoding.cholesky_channel import (
     apply_x_squared_qsvt,
+    build_hermitian_one_body_block_encoding,
     cholesky_channel_block_encoding,
     hermitian_one_body_block_encoding,
     x_squared_qsvt_unitary,
 )
+from composer.circuits.simulator import unitary as circuit_unitary
+from composer.circuits.gate import CircuitCall, MultiplexedGate, SelectGate, StatePreparationGate
 from composer.utils import fermion as jw
 
 
@@ -61,6 +64,21 @@ def test_prep_select_prep_block_matches_O_over_gamma():
         gram = be.one_body_unitary @ be.one_body_unitary.conj().T
     assert np.allclose(gram, np.eye(be.one_body_unitary.shape[0]), atol=1e-9)
     assert np.allclose(be.one_body_top_left_block() * be.alpha, O, atol=1e-9)
+    assert np.allclose(be.one_body_unitary, build_hermitian_one_body_block_encoding(L).unitary, atol=1e-10)
+
+
+def test_structural_one_body_and_degree_two_circuits_match_stored_matrices():
+    rng = np.random.default_rng(11)
+    L = _random_hermitian(3, rng)
+    be = cholesky_channel_block_encoding(L)
+
+    assert np.allclose(circuit_unitary(be.one_body_circuit), be.one_body_unitary, atol=1e-10)
+    assert np.allclose(circuit_unitary(be.circuit), be.unitary, atol=1e-10)
+    assert any(isinstance(op, CircuitCall) for op in be.one_body_circuit.gates)
+    assert any(isinstance(op, StatePreparationGate) for op in be.one_body_circuit.gates)
+    assert any(isinstance(op, CircuitCall) and op.kind == "SELECT_O" for op in be.one_body_circuit.gates)
+    assert any(isinstance(op, MultiplexedGate) for op in be.select_circuit.gates)
+    assert any(isinstance(op, SelectGate) for op in be.circuit.gates)
 
 
 def test_degree_two_transform_returns_full_signal_index_flag_unitary():

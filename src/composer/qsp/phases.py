@@ -32,11 +32,13 @@ and scalar phase-compilation helpers
 
 The direct paper-facing target for generator exponentiation is the
 single complex exponential ``exp(-i alpha x)``. The current repo still
-resolves that target through parity-valid real branches because the
-available scalar phase solver works on real parity-definite targets.
-This module now makes that resolution explicit by compiling a direct
-complex Chebyshev target first and then materializing the structured
-fallback schedule consumed by ``block_encoding/generator_exp.py``.
+starts from that target, but on the current Wx/top-left oracle model a
+single ladder can only realize a definite-parity scalar polynomial.
+Since ``exp(-i alpha x)`` has both even and odd Chebyshev sectors, this
+module now makes the resulting fallback explicit: compile the direct
+complex target first, prove why one ladder is infeasible on the current
+model, and only then materialize the structured parity split consumed by
+``block_encoding/generator_exp.py``.
 
 Anchor the derivation in docstring of
 ``src/composer/qsp/qsvt_poly.py`` for the closed-form ``x -> x^2``
@@ -50,17 +52,18 @@ import numpy as np
 from scipy.optimize import minimize
 
 from .chebyshev import (
+    chebyshev_parity,
     chebyshev_to_monomial,
-    cos_alpha_x_coefficients,
     evaluate_chebyshev,
     jacobi_anger_coefficients,
     recommended_degree,
-    recommended_degree_with_parity,
-    sin_alpha_x_coefficients,
+    split_chebyshev_by_parity,
+    split_exponential_chebyshev_components,
     truncation_error_bound,
 )
 
 __all__ = [
+    "CompiledComplexQSPPhaseSequence",
     "CompiledExponentialQSPPhaseSchedule",
     "CompiledRealQSPPhaseSequence",
     "compile_exponential_qsp_schedule",
@@ -90,12 +93,27 @@ class CompiledRealQSPPhaseSequence:
 
 
 @dataclass(frozen=True)
+class CompiledComplexQSPPhaseSequence:
+    """Compiled scalar phase sequence for one complex parity-valid target."""
+
+    phases: np.ndarray
+    degree: int
+    target_basis: str
+    target_coeffs: np.ndarray
+    n_grid: int
+    loss: float
+
+
+@dataclass(frozen=True)
 class CompiledExponentialQSPPhaseSchedule:
     """Compiled schedule for ``exp(-i alpha x)``.
 
-    ``complex_chebyshev_coeffs`` retains the direct Appendix-C target,
-    while ``cos_sequence`` and ``sin_sequence`` expose the structured
-    parity-split realization used by the current repo.
+    ``complex_chebyshev_coeffs`` retains the direct Appendix-C target.
+    ``direct_sequence`` is populated only if the current scalar oracle
+    model can realize that mixed- or definite-parity target directly.
+    On the current repo scope the exponential has mixed parity, so the
+    direct single-ladder request is resolved into ``cos_sequence`` and
+    ``sin_sequence`` derived from the direct complex coefficients.
     """
 
     alpha: float
@@ -104,13 +122,18 @@ class CompiledExponentialQSPPhaseSchedule:
     resolved_strategy: str
     complex_degree: int
     complex_chebyshev_coeffs: np.ndarray
+    complex_even_chebyshev_coeffs: np.ndarray
+    complex_odd_chebyshev_coeffs: np.ndarray
     truncation_error_bound: float
+    direct_sequence: CompiledComplexQSPPhaseSequence | None
+    direct_complex_supported: bool
+    fallback_reason: str | None
     cos_sequence: CompiledRealQSPPhaseSequence
     sin_sequence: CompiledRealQSPPhaseSequence
 
     @property
     def uses_single_ladder(self) -> bool:
-        return False
+        return self.direct_sequence is not None
 
 
 def qsp_signal(x: float) -> np.ndarray:
@@ -306,16 +329,35 @@ def compile_exponential_qsp_schedule(
     rng_seed: int = 0,
 ) -> CompiledExponentialQSPPhaseSchedule:
     """Compile the scalar phase schedule for ``exp(-i alpha x)``."""
-    if strategy not in {"auto", "parity_split"}:
-        raise ValueError("strategy must be 'auto' or 'parity_split'")
+    if strategy not in {"auto", "direct_complex", "parity_split"}:
+        raise ValueError("strategy must be 'auto', 'direct_complex', or 'parity_split'")
     complex_degree = recommended_degree(alpha, eps)
     complex_coeffs = jacobi_anger_coefficients(alpha, complex_degree)
-    cos_degree = recommended_degree_with_parity(alpha, eps / 2.0, parity=0)
-    sin_degree = recommended_degree_with_parity(alpha, eps / 2.0, parity=1)
+    complex_even_coeffs, complex_odd_coeffs = split_chebyshev_by_parity(complex_coeffs)
+    cos_coeffs, sin_coeffs = split_exponential_chebyshev_components(complex_coeffs)
+    direct_parity = chebyshev_parity(complex_coeffs)
+    direct_supported = direct_parity is not None
+    direct_sequence: CompiledComplexQSPPhaseSequence | None = None
+    resolved_strategy = "direct_complex_single_ladder" if direct_supported else "parity_split_due_mixed_parity"
+    fallback_reason: str | None = None
+    if not direct_supported:
+        fallback_reason = (
+            "single-ladder Wx-QSP top-left polynomials have definite parity, "
+            "but exp(-i alpha x) contains both even and odd Chebyshev sectors"
+        )
+
+    if strategy == "direct_complex" and direct_supported:
+        raise NotImplementedError(
+            "direct complex single-ladder phase synthesis is only wired for parity-definite targets; "
+            "the exponential target would need a constructive direct compiler once supported"
+        )
+
+    cos_degree = len(cos_coeffs) - 1
+    sin_degree = len(sin_coeffs) - 1
     cos_grid = n_grid or max(81, 8 * cos_degree + 1)
     sin_grid = n_grid or max(81, 8 * sin_degree + 1)
     cos_sequence = compile_real_chebyshev_phase_sequence(
-        cos_alpha_x_coefficients(alpha, cos_degree),
+        cos_coeffs,
         parity=0,
         n_grid=cos_grid,
         tol=tol,
@@ -324,7 +366,7 @@ def compile_exponential_qsp_schedule(
         rng_seed=rng_seed,
     )
     sin_sequence = compile_real_chebyshev_phase_sequence(
-        sin_alpha_x_coefficients(alpha, sin_degree),
+        sin_coeffs,
         parity=1,
         n_grid=sin_grid,
         tol=tol,
@@ -336,10 +378,15 @@ def compile_exponential_qsp_schedule(
         alpha=alpha,
         eps=eps,
         requested_strategy=strategy,
-        resolved_strategy="parity_split_chebyshev",
+        resolved_strategy=resolved_strategy,
         complex_degree=complex_degree,
         complex_chebyshev_coeffs=complex_coeffs,
+        complex_even_chebyshev_coeffs=complex_even_coeffs,
+        complex_odd_chebyshev_coeffs=complex_odd_coeffs,
         truncation_error_bound=truncation_error_bound(alpha, complex_degree),
+        direct_sequence=direct_sequence,
+        direct_complex_supported=direct_supported,
+        fallback_reason=fallback_reason,
         cos_sequence=cos_sequence,
         sin_sequence=sin_sequence,
     )

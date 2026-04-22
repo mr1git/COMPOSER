@@ -19,15 +19,24 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..circuits.circuit import Circuit
-from ..circuits.gate import Gate
+from ..circuits.gate import (
+    AncillaZeroReflectionGate,
+    CircuitCall,
+    Gate,
+    MultiplexedGate,
+    SelectGate,
+    StatePreparationGate,
+)
 from ..circuits.simulator import unitary as circuit_unitary
-from ..ladders.one_electron import mode_rotation_unitary, x_gate
+from ..ladders.one_electron import build_number_conserving_ladder, x_gate
 from ..qsp.qsvt_poly import degree_two_projector_transform
 from ..utils import fermion as jw
 
 __all__ = [
     "CholeskyChannelBlockEncoding",
+    "HermitianOneBodyBlockEncoding",
     "apply_x_squared_qsvt",
+    "build_hermitian_one_body_block_encoding",
     "build_cholesky_channel_block_encoding",
     "cholesky_channel_block_encoding",
     "hermitian_one_body_block_encoding",
@@ -126,6 +135,19 @@ def _prep_unitary(weights_abs: np.ndarray, n_ancilla: int) -> np.ndarray:
     return M
 
 
+def _identity_circuit(width: int) -> Circuit:
+    return Circuit(num_qubits=width)
+
+
+def _hadamard_gate(qubit: int) -> Gate:
+    return Gate(
+        name="H",
+        qubits=(qubit,),
+        matrix=np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0),
+        kind="H",
+    )
+
+
 def _select_unitary(
     branches: list[np.ndarray],
     *,
@@ -166,6 +188,37 @@ def _occupation_flag_unitary(
         return lifted_rotation @ flag_projector @ lifted_rotation.conj().T
 
 
+def _occupation_flag_circuit(
+    orbital: np.ndarray,
+    *,
+    pivot: int,
+    n_system: int,
+) -> Circuit:
+    """Return the explicit rotated-mode occupation-flag circuit."""
+    flag = n_system
+    ladder = build_number_conserving_ladder(orbital, n_qubits=n_system, pivot=pivot)
+    circuit = Circuit(num_qubits=n_system + 1)
+    circuit.append(
+        CircuitCall(
+            name="U_mode^dag",
+            qubits=tuple(range(n_system)),
+            subcircuit=ladder.inverse(),
+            kind="U_mode_rotation",
+        )
+    )
+    circuit.append(_cnot_gate(control=pivot, target=flag))
+    circuit.append(x_gate(flag))
+    circuit.append(
+        CircuitCall(
+            name="U_mode",
+            qubits=tuple(range(n_system)),
+            subcircuit=ladder,
+            kind="U_mode_rotation",
+        )
+    )
+    return circuit
+
+
 def _one_body_dense(L: np.ndarray, n_qubits: int) -> np.ndarray:
     """Return ``sum_pq L_pq a_p^dag a_q`` as a dense JW matrix."""
     n_orb = L.shape[0]
@@ -182,17 +235,73 @@ def _one_body_dense(L: np.ndarray, n_qubits: int) -> np.ndarray:
     return 0.5 * (O + O.conj().T)
 
 
+def _degree_two_projector_transform_circuit(
+    block_circuit: Circuit,
+    *,
+    n_block_ancilla: int,
+    n_system: int,
+) -> Circuit:
+    """Structural counterpart of ``degree_two_projector_transform``."""
+    if block_circuit.num_qubits != n_system + n_block_ancilla:
+        raise ValueError("block_circuit width must equal system plus block ancillas")
+    signal = block_circuit.num_qubits
+    block_ancillas = tuple(range(n_system, n_system + n_block_ancilla))
+    reflection_branch = Circuit(num_qubits=n_block_ancilla)
+    reflection_branch.append(
+        AncillaZeroReflectionGate(
+            name="REFLECT_block_zero",
+            qubits=tuple(range(n_block_ancilla)),
+            system_width=0,
+            kind="REFLECT_block_zero",
+        )
+    )
+
+    circuit = Circuit(num_qubits=block_circuit.num_qubits + 1)
+    circuit.append(
+        CircuitCall(
+            name="U_one_body",
+            qubits=tuple(range(block_circuit.num_qubits)),
+            subcircuit=block_circuit,
+            kind="U_one_body",
+        )
+    )
+    circuit.append(_hadamard_gate(signal))
+    circuit.append(
+        SelectGate(
+            name="SELECT_projector_zero",
+            qubits=block_ancillas + (signal,),
+            zero_circuit=_identity_circuit(n_block_ancilla),
+            one_circuit=reflection_branch,
+            kind="SELECT_projector_zero",
+        )
+    )
+    circuit.append(_hadamard_gate(signal))
+    circuit.append(
+        CircuitCall(
+            name="U_one_body",
+            qubits=tuple(range(block_circuit.num_qubits)),
+            subcircuit=block_circuit,
+            kind="U_one_body",
+        )
+    )
+    return circuit
+
+
 @dataclass
 class CholeskyChannelBlockEncoding:
     """Structured output of the Appendix B.2 Lemma-2 construction."""
 
+    circuit: Circuit
     unitary: np.ndarray
     alpha: float
     n_system: int
     n_index: int
+    one_body_circuit: Circuit
     one_body_unitary: np.ndarray
+    select_circuit: Circuit
     prep_unitary: np.ndarray
     select_unitary: np.ndarray
+    branch_circuits: tuple[Circuit, ...]
     branch_unitaries: tuple[np.ndarray, ...]
     select_branch_unitaries: tuple[np.ndarray, ...]
     eigenvalues: np.ndarray
@@ -230,6 +339,175 @@ class CholeskyChannelBlockEncoding:
         return _top_left_block(branches[index], self.n_system)
 
 
+@dataclass
+class HermitianOneBodyBlockEncoding:
+    """Explicit PREP-SELECT-PREP† encoding of ``O / Gamma``."""
+
+    circuit: Circuit
+    unitary: np.ndarray
+    alpha: float
+    n_system: int
+    n_index: int
+    select_circuit: Circuit
+    prep_unitary: np.ndarray
+    select_unitary: np.ndarray
+    branch_circuits: tuple[Circuit, ...]
+    branch_unitaries: tuple[np.ndarray, ...]
+    select_branch_unitaries: tuple[np.ndarray, ...]
+    eigenvalues: np.ndarray
+    orbitals: np.ndarray
+    pivots: tuple[int, ...]
+
+    @property
+    def n_flag(self) -> int:
+        return 1
+
+    @property
+    def n_ancilla(self) -> int:
+        return self.n_index + self.n_flag
+
+    def top_left_block(self) -> np.ndarray:
+        return _top_left_block(self.unitary, self.n_system)
+
+    def branch_top_left_block(self, index: int, *, include_phase: bool = False) -> np.ndarray:
+        branches = self.select_branch_unitaries if include_phase else self.branch_unitaries
+        if not (0 <= index < len(branches)):
+            raise IndexError(
+                f"branch index {index} out of range for {len(branches)} retained modes"
+            )
+        return _top_left_block(branches[index], self.n_system)
+
+
+def build_hermitian_one_body_block_encoding(
+    L: np.ndarray,
+    n_qubits: int | None = None,
+    *,
+    spectral_tol: float = 1e-12,
+) -> HermitianOneBodyBlockEncoding:
+    """Build the explicit rotated-mode PREP-SELECT-PREP† encoding of ``O / Gamma``."""
+    L = np.asarray(L, dtype=complex)
+    if L.ndim != 2 or L.shape[0] != L.shape[1]:
+        raise ValueError(f"L must be square, got shape {L.shape}")
+    if not np.allclose(L, L.conj().T, atol=1e-10):
+        raise ValueError("L must be Hermitian")
+    n_orb = int(L.shape[0])
+    n = n_orb if n_qubits is None else int(n_qubits)
+    if n < n_orb:
+        raise ValueError(f"n_qubits={n} < L.shape[0]={n_orb}")
+
+    eigvals, eigvecs = np.linalg.eigh(L)
+    keep = np.flatnonzero(np.abs(eigvals) > spectral_tol)
+    if keep.size == 0:
+        circuit = Circuit(num_qubits=n + 1)
+        circuit.append(x_gate(n))
+        unitary = circuit_unitary(circuit)
+        return HermitianOneBodyBlockEncoding(
+            circuit=circuit,
+            unitary=unitary,
+            alpha=1.0,
+            n_system=n,
+            n_index=0,
+            select_circuit=circuit,
+            prep_unitary=np.ones((1, 1), dtype=complex),
+            select_unitary=unitary,
+            branch_circuits=tuple(),
+            branch_unitaries=tuple(),
+            select_branch_unitaries=tuple(),
+            eigenvalues=np.zeros(0, dtype=float),
+            orbitals=np.zeros((0, n_orb), dtype=complex),
+            pivots=tuple(),
+        )
+
+    retained_vals = eigvals[keep]
+    retained_vecs = eigvecs[:, keep]
+    order = np.argsort(-np.abs(retained_vals), kind="stable")
+    retained_vals = retained_vals[order]
+    retained_vecs = retained_vecs[:, order]
+
+    alpha = float(np.sum(np.abs(retained_vals)))
+    n_index = int(np.ceil(np.log2(retained_vals.shape[0]))) if retained_vals.shape[0] > 1 else 0
+    prep_amplitudes = np.zeros(1 << n_index, dtype=complex)
+    prep_amplitudes[: retained_vals.shape[0]] = np.sqrt(np.abs(retained_vals) / alpha)
+
+    branch_circuits: list[Circuit] = []
+    branch_unitaries: list[np.ndarray] = []
+    select_branch_unitaries: list[np.ndarray] = []
+    branch_phases: list[complex] = []
+    pivots: list[int] = []
+    orbitals: list[np.ndarray] = []
+    for lam, vec in zip(retained_vals, retained_vecs.T):
+        pivot = int(np.argmax(np.abs(vec)))
+        branch_circuit = _occupation_flag_circuit(vec, pivot=pivot, n_system=n)
+        branch_unitary = circuit_unitary(branch_circuit)
+        phase = np.exp(1j * np.angle(lam))
+        branch_circuits.append(branch_circuit)
+        branch_unitaries.append(branch_unitary)
+        select_branch_unitaries.append(phase * branch_unitary)
+        branch_phases.append(phase)
+        pivots.append(pivot)
+        orbitals.append(np.asarray(vec, dtype=complex))
+
+    selector_qubits = tuple(range(n + 1, n + 1 + n_index))
+    select_circuit = Circuit(num_qubits=n + 1 + n_index)
+    select_circuit.append(
+        MultiplexedGate(
+            name="SELECT_O",
+            qubits=tuple(range(n + 1 + n_index)),
+            selector_width=n_index,
+            branch_circuits=tuple(branch_circuits),
+            default_circuit=_identity_circuit(n + 1),
+            branch_phases=tuple(branch_phases),
+            kind="SELECT_O",
+        )
+    )
+
+    circuit = Circuit(num_qubits=n + 1 + n_index)
+    if n_index > 0:
+        circuit.append(
+            StatePreparationGate(
+                name="PREP_O",
+                qubits=selector_qubits,
+                amplitudes=prep_amplitudes,
+                kind="PREP_O",
+            )
+        )
+    circuit.append(
+        CircuitCall(
+            name="SELECT_O",
+            qubits=tuple(range(n + 1 + n_index)),
+            subcircuit=select_circuit,
+            kind="SELECT_O",
+        )
+    )
+    if n_index > 0:
+        circuit.append(
+            StatePreparationGate(
+                name="PREP_O^dag",
+                qubits=selector_qubits,
+                amplitudes=prep_amplitudes,
+                kind="PREP_O",
+                adjoint=True,
+            )
+        )
+
+    return HermitianOneBodyBlockEncoding(
+        circuit=circuit,
+        unitary=circuit_unitary(circuit),
+        alpha=alpha,
+        n_system=n,
+        n_index=n_index,
+        select_circuit=select_circuit,
+        prep_unitary=_prep_unitary(np.abs(retained_vals), n_index),
+        select_unitary=circuit_unitary(select_circuit),
+        branch_circuits=tuple(branch_circuits),
+        branch_unitaries=tuple(branch_unitaries),
+        select_branch_unitaries=tuple(select_branch_unitaries),
+        eigenvalues=np.asarray(retained_vals, dtype=float),
+        orbitals=np.asarray(orbitals, dtype=complex),
+        pivots=tuple(pivots),
+    )
+
+
 def build_cholesky_channel_block_encoding(
     L: np.ndarray,
     n_qubits: int | None = None,
@@ -249,83 +527,34 @@ def build_cholesky_channel_block_encoding(
     system qubits are least significant, then flag, then index, then
     the signal qubit.
     """
-    L = np.asarray(L, dtype=complex)
-    if L.ndim != 2 or L.shape[0] != L.shape[1]:
-        raise ValueError(f"L must be square, got shape {L.shape}")
-    if not np.allclose(L, L.conj().T, atol=1e-10):
-        raise ValueError("L must be Hermitian")
-    n_orb = int(L.shape[0])
-    n = n_orb if n_qubits is None else int(n_qubits)
-    if n < n_orb:
-        raise ValueError(f"n_qubits={n} < L.shape[0]={n_orb}")
-
-    eigvals, eigvecs = np.linalg.eigh(L)
-    keep = np.flatnonzero(np.abs(eigvals) > spectral_tol)
-
-    if keep.size == 0:
-        alpha = 1.0
-        n_index = 0
-        prep = np.ones((1, 1), dtype=complex)
-        zero_branch = np.kron(np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex), np.eye(1 << n))
-        one_body = zero_branch
-        full = degree_two_projector_transform(one_body, n_block_ancilla=1)
-        return CholeskyChannelBlockEncoding(
-            unitary=full,
-            alpha=alpha,
-            n_system=n,
-            n_index=n_index,
-            one_body_unitary=one_body,
-            prep_unitary=prep,
-            select_unitary=zero_branch,
-            branch_unitaries=tuple(),
-            select_branch_unitaries=tuple(),
-            eigenvalues=np.zeros(0, dtype=float),
-            orbitals=np.zeros((0, n_orb), dtype=complex),
-            pivots=tuple(),
-        )
-
-    retained_vals = eigvals[keep]
-    retained_vecs = eigvecs[:, keep]
-    order = np.argsort(-np.abs(retained_vals), kind="stable")
-    retained_vals = retained_vals[order]
-    retained_vecs = retained_vecs[:, order]
-
-    alpha = float(np.sum(np.abs(retained_vals)))
-    n_index = int(np.ceil(np.log2(retained_vals.shape[0]))) if retained_vals.shape[0] > 1 else 0
-
-    branch_unitaries: list[np.ndarray] = []
-    select_branches: list[np.ndarray] = []
-    pivots: list[int] = []
-    orbitals: list[np.ndarray] = []
-    for lam, vec in zip(retained_vals, retained_vecs.T):
-        U_mode, pivot = mode_rotation_unitary(vec, n_qubits=n)
-        branch = _occupation_flag_unitary(U_mode, pivot=pivot, n_system=n)
-        phase = np.exp(1j * np.angle(lam))
-        branch_unitaries.append(branch)
-        select_branches.append(phase * branch)
-        pivots.append(pivot)
-        orbitals.append(np.asarray(vec, dtype=complex))
-
-    prep = _prep_unitary(np.abs(retained_vals), n_index)
-    select = _select_unitary(select_branches, n_index=n_index, n_system=n)
-    prep_full = np.kron(prep, np.eye(1 << (n + 1), dtype=complex))
-    with np.errstate(all="ignore"):
-        one_body = prep_full.conj().T @ select @ prep_full
-    full = degree_two_projector_transform(one_body, n_block_ancilla=n_index + 1)
-
+    one_body_be = build_hermitian_one_body_block_encoding(
+        L,
+        n_qubits=n_qubits,
+        spectral_tol=spectral_tol,
+    )
+    full_circuit = _degree_two_projector_transform_circuit(
+        one_body_be.circuit,
+        n_block_ancilla=one_body_be.n_ancilla,
+        n_system=one_body_be.n_system,
+    )
+    full = circuit_unitary(full_circuit)
     return CholeskyChannelBlockEncoding(
+        circuit=full_circuit,
         unitary=full,
-        alpha=alpha,
-        n_system=n,
-        n_index=n_index,
-        one_body_unitary=one_body,
-        prep_unitary=prep,
-        select_unitary=select,
-        branch_unitaries=tuple(branch_unitaries),
-        select_branch_unitaries=tuple(select_branches),
-        eigenvalues=np.asarray(retained_vals, dtype=float),
-        orbitals=np.asarray(orbitals, dtype=complex),
-        pivots=tuple(pivots),
+        alpha=one_body_be.alpha,
+        n_system=one_body_be.n_system,
+        n_index=one_body_be.n_index,
+        one_body_circuit=one_body_be.circuit,
+        one_body_unitary=one_body_be.unitary,
+        select_circuit=one_body_be.select_circuit,
+        prep_unitary=one_body_be.prep_unitary,
+        select_unitary=one_body_be.select_unitary,
+        branch_circuits=one_body_be.branch_circuits,
+        branch_unitaries=one_body_be.branch_unitaries,
+        select_branch_unitaries=one_body_be.select_branch_unitaries,
+        eigenvalues=one_body_be.eigenvalues,
+        orbitals=one_body_be.orbitals,
+        pivots=one_body_be.pivots,
     )
 
 

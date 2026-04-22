@@ -87,16 +87,66 @@ def _supported_python_floor() -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def _stdlib_module_names() -> set[str]:
-    names = set(getattr(sys, "stdlib_module_names", ()))
-    if names:
-        return names
-    names.update(sys.builtin_module_names)
-    stdlib_path = sysconfig.get_path("stdlib")
-    if stdlib_path:
-        for info in pkgutil.iter_modules([stdlib_path]):
-            names.add(info.name)
-    return names
+def _resolve_paths(paths: list[str | None]) -> tuple[Path, ...]:
+    resolved: list[Path] = []
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        path = Path(raw_path).resolve()
+        if path not in resolved:
+            resolved.append(path)
+    return tuple(resolved)
+
+
+def _path_is_within(path: Path, roots: tuple[Path, ...]) -> bool:
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
+def _stdlib_search_roots() -> tuple[Path, ...]:
+    roots = list(
+        _resolve_paths(
+            [
+                sysconfig.get_path("stdlib"),
+                sysconfig.get_path("platstdlib"),
+                sysconfig.get_config_var("DESTSHARED"),
+            ]
+        )
+    )
+    for root in list(roots):
+        dynload = root / "lib-dynload"
+        if dynload.is_dir() and dynload not in roots:
+            roots.append(dynload)
+    return tuple(roots)
+
+
+def _site_packages_roots() -> tuple[Path, ...]:
+    return _resolve_paths([sysconfig.get_path("purelib"), sysconfig.get_path("platlib")])
+
+
+def _is_stdlib_module(name: str) -> bool:
+    if name in getattr(sys, "stdlib_module_names", ()):
+        return True
+    if name in sys.builtin_module_names:
+        return True
+
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        return False
+    if spec.origin in {"built-in", "frozen"}:
+        return True
+
+    stdlib_roots = _stdlib_search_roots()
+    site_packages_roots = _site_packages_roots()
+
+    def is_stdlib_path(path_str: str) -> bool:
+        path = Path(path_str).resolve()
+        return _path_is_within(path, stdlib_roots) and not _path_is_within(path, site_packages_roots)
+
+    if spec.submodule_search_locations:
+        return all(is_stdlib_path(location) for location in spec.submodule_search_locations)
+    if spec.origin:
+        return is_stdlib_path(spec.origin)
+    return False
 
 
 def _third_party_import_roots() -> set[str]:
@@ -111,11 +161,10 @@ def _third_party_import_roots() -> set[str]:
                 if node.level > 0 or node.module is None:
                     continue
                 roots.add(node.module.split(".")[0])
-    stdlib = _stdlib_module_names()
     return {
         root
         for root in roots
-        if root not in stdlib and root not in {"__future__", "composer"}
+        if root not in {"__future__", "composer"} and not _is_stdlib_module(root)
     }
 
 
@@ -150,6 +199,10 @@ def test_declared_dependencies_cover_runtime_imports():
     assert third_party_imports <= (runtime_dependencies | optional_dependencies)
     assert runtime_dependencies == {"numpy", "scipy"}
     assert optional_dependencies == {"qiskit"}
+
+
+def test_stdlib_detection_covers_extension_modules():
+    assert _is_stdlib_module("cmath")
 
 
 def test_pytest_pythonpath_includes_src_checkout():
@@ -511,6 +564,7 @@ def test_circuit_resource_report_tracks_recursive_selector_and_ancilla_overhead(
         "X": 2,
     }
     assert report.compiled.dense_leaf_gate_count == 6
+    assert report.compiled.dense_leaf_gate_count_by_kind == {"H": 1, "I": 3, "X": 2}
     assert report.compiled.structural_gate_count == 3
     assert report.compiled.selector_control.select_gate_count == 1
     assert report.compiled.selector_control.multiplexed_gate_count == 1

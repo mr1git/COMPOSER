@@ -25,25 +25,32 @@ architecture described in the paper.
   now represented structurally via synthesized `PREP_*`
   state-preparation primitives and explicit multiplexed `SELECT_*`
   dispatch objects rather than only as one dense PREP matrix and one
-  dense block-diagonal SELECT matrix.
+  dense block-diagonal SELECT matrix, and the Hamiltonian/one-body
+  branches no longer hide the Lemma-2 content behind opaque dense
+  `W_*` wrappers. The widened Hamiltonian branch workspace is now kept
+  honest in the compiled circuit, while the ancilla-zero block is
+  extracted directly from that compiled circuit; the full dense
+  Hamiltonian unitary remains available only as a lazy verification
+  property.
 * A real sigma-pool oracle for the compiled generator pool:
   explicit singles channels plus pair-SVD doubles channels on a fixed
   selector register, mask-aware `PREP_sigma`, branch-multiplexed
   `SELECT_sigma`, and an explicit null branch over the compiled pool
-  (Sec IV.B, Eq 39-43). Singles still use the exact one-body branch
+  (Sec IV.B, Eq 39-43). Singles now use the exact one-body branch
   encoding; doubles now use explicit channel-local internal
   `PREP_pair`/`SELECT_pair` adaptors over canonical pair excitations
   rather than the old dense full-Fock Hermitian fallback.
 * Scalar QSP utilities plus an oracle-facing generator-exponential
   construction: a compiled exponential phase schedule rooted in the
-  direct complex Jacobi-Anger target `exp(-i alpha x)`, currently
-  resolved into parity-resolved QSP ladders for `cos` / `sin` on the
-  compiled `U_sigma`, explicit block-level Hermitian-part extraction,
-  and a final LCU for `e^{sigma}`. The returned object now keeps both
-  the direct complex target metadata and the resolved real-branch
-  subcircuits, rather than issuing two ad hoc trig-specific fits at the
-  generator layer. Dense matrices are synthesized only in the
-  verification helpers/properties. The
+  direct complex Jacobi-Anger target `exp(-i alpha x)`, and it now
+  requests a single direct complex compile first. On the current
+  repo-wide Wx/top-left circuit model that target is mixed parity, so
+  the schedule records the explicit fallback reason and then derives the
+  parity-resolved `cos` / `sin` ladders directly from the complex
+  coefficients before building the compiled `U_sigma` subcircuits,
+  explicit block-level Hermitian-part extraction, and the final LCU for
+  `e^{sigma}`. Dense matrices are synthesized only in the verification
+  helpers/properties. The
   oblivious-amplitude-amplification stage now also uses explicit
   ancilla-zero reflection primitives rather than full-width dense
   reflection matrices. A dense Chebyshev matrix path is retained only
@@ -128,16 +135,24 @@ The repo now has a stable three-layer story:
   explicit compiled `Circuit` structure rather than one dense outer
   placeholder. Use `resource_summary()` for top-level logical counts and
   `resource_report(system_width=...)` for recursive ancilla /
-  selector-control / dense-leaf reporting.
+  selector-control / dense-leaf reporting, including
+  `dense_leaf_gate_count_by_kind` so the remaining low-level dense
+  primitives are explicit.
 * **Optional backend/export behavior**: install `'.[qiskit]'` to export
   compiled circuits and request backend-side resource views such as
   depth, gate-family histograms, and two-qubit counts when the chosen
   export/transpilation basis makes those quantities representable.
 
 The dense reference layer is still retained deliberately. A compiled
-path may still contain dense leaf stand-ins for some local primitives;
-the new reports surface those leaves explicitly instead of pretending
-they are already elementary-gate synthesis.
+path may still contain dense leaf stand-ins for local primitives such
+as full-register fermionic `Givens(...)`, `PhasedPairGivens(...)`, and
+`PAIR_branch_reflection` leaves; the new reports surface those leaves
+explicitly by kind instead of pretending they are already elementary
+gate synthesis. At the outer-oracle level, the repo no longer
+materializes every compiled circuit as one full dense unitary up front:
+for the Hamiltonian and similarity objects, the paper-facing
+ancilla-zero block is extracted directly from the compiled circuit and
+the full dense unitary is synthesized only if a caller asks for it.
 
 The top-level `composer` package intentionally keeps a narrow surface:
 import concrete functionality from submodules such as
@@ -208,7 +223,8 @@ Resource-report contract:
   summary tied to the compiled COMPOSER object itself.
 * `Circuit.resource_report(system_width=...)` adds recursive compiled
   synthesis reporting: ancilla count, recursive gate-family inventory,
-  selector/control-state overhead, and dense-leaf counts.
+  selector/control-state overhead, dense-leaf counts, and
+  dense-leaf-kind histograms.
 * `Circuit.resource_report(..., backend="qiskit", basis_gates=("u", "cx"))`
   adds a separate backend/export view. This can report transpiled depth
   and two-qubit counts for the flattened exported circuit, but only
@@ -228,7 +244,12 @@ pytest run.
 
 `tests/test_foundation.py` still treats Python `<3.10` as explicitly
 unsupported: the floor check is reported as such instead of failing for
-an unrelated import/stdlib-introspection reason.
+an unrelated import/stdlib-introspection reason. Its dependency audit
+also treats stdlib extension modules such as `cmath` correctly: on
+Python `3.10+` it uses `sys.stdlib_module_names`, and when that
+interpreter hook is unavailable it falls back to import-spec origin
+checks that include stdlib `lib-dynload` modules without mistaking
+`site-packages` for the stdlib.
 
 ## Design intent
 
@@ -244,7 +265,11 @@ Reference validation remains centered on `python -m pytest` plus the
 shipped examples. `examples/05_similarity_sandwich.py` is intentionally
 the slowest supported workflow because it includes scalar QSP phase
 fitting plus dense oracle verification on a synthetic `3 occ / 3 vir`
-system.
+system. After the 2026-04-22 closure pass, the remaining runtime long
+pole is those repeated generator/QSP fits and their downstream dense
+verification; the old eager dense Hamiltonian-unitary blow-up was
+removed, but `python -m pytest` and `examples/05_similarity_sandwich.py`
+can still take many minutes on a laptop-class machine.
 
 The pytest suite covers these baseline numerical checks:
 
@@ -261,7 +286,8 @@ The pytest suite covers these baseline numerical checks:
   (`tests/test_lcu.py`, `tests/test_end_to_end_h2.py`). The test path
   now also locks in that `PREP_H` is a synthesized state-preparation
   primitive and `SELECT_H` is an explicit compiled multiplexor rather
-  than a dense fallback gate.
+  than a dense fallback gate, and that `top_left_block()` remains
+  available without eagerly materializing the full compiled unitary.
 * **Sigma-pool oracle** — the ancilla-zero block of the returned
   `PREP_sigma`/`SELECT_sigma`/`PREP_sigma^dag` oracle equals
   `-i sigma_pool(m) / alpha_bar` for the full compiled singles+doubles
@@ -275,16 +301,20 @@ The pytest suite covers these baseline numerical checks:
   (`tests/test_generator_exp.py`, `tests/test_similarity_sandwich.py`).
 * **Generator-exp oracle/QSP path** — the main path now builds
   `e^{sigma}` from the compiled sigma oracle using an exponential phase
-  compiler rooted in the direct complex target and resolved, on the
-  current repo scope, into parity-split QSP plus LCU. It keeps repeated
-  oracle queries and the `cos`/`sin` / final-LCU layers as reusable
-  compiled subcircuits, exposes the resolved phase-compilation strategy
-  and complex truncation degree on the returned object/resources, is
-  checked numerically against `scipy.linalg.expm` on small masked
-  generators including mixed singles+doubles cases, and reports actual
-  compiled `cos`/`sin` QSP query counts. The compiled path now also
-  keeps its PREP layers and ancilla-zero reflections as structural
-  primitives (`tests/test_generator_exp.py`).
+  compiler rooted in the direct complex target and now explicitly
+  requests a direct complex single-ladder compile first. On the current
+  repo scope that request resolves into parity-split QSP plus LCU only
+  because one Wx/top-left ladder can carry only a definite-parity
+  scalar polynomial, while `exp(-i alpha x)` is mixed parity. The
+  returned schedule records that fallback reason, keeps repeated oracle
+  queries and the `cos`/`sin` / final-LCU layers as reusable compiled
+  subcircuits, exposes the resolved strategy and complex truncation
+  degree on the returned object/resources, is checked numerically
+  against `scipy.linalg.expm` on small masked generators including
+  mixed singles+doubles cases, and reports actual compiled `cos`/`sin`
+  QSP query counts. The compiled path now also keeps its PREP layers
+  and ancilla-zero reflections as structural primitives
+  (`tests/test_generator_exp.py`).
 * **Dense Chebyshev reference for `exp(sigma)`** — kept only as a dense
   reference and still checked against both `scipy.linalg.expm` and the
   exact truncated polynomial (`tests/test_generator_exp.py`).
@@ -332,10 +362,12 @@ not an active feature branch. Remaining intentional limitations are:
   real-integral electronic-structure case documented in
   [`ASSUMPTIONS.md`](ASSUMPTIONS.md).
 * Generator exponentiation now compiles phases from the direct complex
-  target `exp(-i alpha x)`, but the resolved ladder synthesis still uses
-  a structured parity split (`cos` / `sin` plus LCU and one round of
-  oblivious amplitude amplification), not one fully direct complex
-  phase list.
+  target `exp(-i alpha x)` and requests a direct complex single-ladder
+  compile first, but the current Wx/top-left circuit model can only
+  realize definite-parity scalar ladders. The resolved implementation
+  therefore still uses a structured parity split (`cos` / `sin` plus
+  LCU and one round of oblivious amplitude amplification), with that
+  fallback reason carried explicitly on the returned phase schedule.
 * Resource summaries are logical compiled-object accounting only; the
   repo does not estimate fault-tolerant synthesis costs.
 * Backend/export resource views depend on optional SDK support and on

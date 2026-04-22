@@ -42,7 +42,7 @@ from scipy.linalg import expm
 
 from ..circuits.circuit import Circuit, CircuitResourceSummary
 from ..circuits.gate import CircuitCall
-from ..circuits.simulator import unitary as circuit_unitary
+from ..circuits.simulator import ancilla_zero_system_block
 from ..operators.generator import ClusterGenerator
 from ..operators.hamiltonian import HamiltonianPool
 from ..operators.mask import ChannelMask, uniform_mask
@@ -201,42 +201,6 @@ def _compiled_sigma_template(
     return template_oracle.channel_norms, target_alpha
 
 
-def _lift_oracle_matrix(W: np.ndarray, *, n_extra_ancilla: int) -> np.ndarray:
-    """Embed an oracle matrix with idle high-order ancillas if needed."""
-    if n_extra_ancilla < 0:
-        raise ValueError("n_extra_ancilla must be non-negative")
-    if n_extra_ancilla == 0:
-        return W
-    return np.kron(np.eye(2**n_extra_ancilla, dtype=complex), W)
-
-
-def _nested_ancilla_zero_system_block(
-    generator_exp_oracle: GeneratorExpOracle,
-    hamiltonian_oracle: LCUBlockEncoding,
-    *,
-    n_total_ancilla: int,
-) -> np.ndarray:
-    """Return the exact ancilla-zero block of ``U_sigma^dag W_H U_sigma``.
-
-    The returned outer circuit uses the real compiled child oracles on a
-    shared ancilla layout. The ancilla-zero block of the nested product
-    can therefore be formed exactly from the lifted child oracle
-    matrices without simulating the outer circuit column-by-column.
-    """
-    n_system = generator_exp_oracle.n_system
-    dim_sys = 2**n_system
-    U_sigma_full = _lift_oracle_matrix(
-        circuit_unitary(generator_exp_oracle.unitary_circuit),
-        n_extra_ancilla=n_total_ancilla - generator_exp_oracle.n_ancilla,
-    )
-    W_H_full = _lift_oracle_matrix(
-        hamiltonian_oracle.W,
-        n_extra_ancilla=n_total_ancilla - hamiltonian_oracle.n_ancilla,
-    )
-    ancilla_zero_columns = U_sigma_full[:, :dim_sys]
-    return ancilla_zero_columns.conj().T @ W_H_full @ ancilla_zero_columns
-
-
 def _build_similarity_sandwich_from_compiled_parts(
     pool: HamiltonianPool,
     generator: ClusterGenerator,
@@ -297,11 +261,7 @@ def _build_similarity_sandwich_from_compiled_parts(
         )
     )
 
-    encoded_system_block = _nested_ancilla_zero_system_block(
-        generator_exp_oracle,
-        hamiltonian_oracle,
-        n_total_ancilla=total_ancilla,
-    )
+    encoded_system_block = ancilla_zero_system_block(circuit, system_width=n_sys)
     H_eff = effective_hamiltonian_dense(pool, generator, compiled_mask, projector)
 
     resources = SimilaritySandwichResourceSummary(

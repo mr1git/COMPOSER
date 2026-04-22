@@ -94,10 +94,12 @@ treated analogously." The repo now compiles them into the sigma oracle
 as explicit branches, but not via the Lemma-1 dyad gadget: Lemma 1 is
 only verified on the `N=1` sector, while the generator oracle needs the
 full Fock-space operator `-i(L - L^dag)`. We therefore use the exact
-full-Fock Hermitian one-body block encoding returned by
-`hermitian_one_body_block_encoding(...)` for each singles branch. This
-is the closest-feasible literal realization on the current circuit
-model.
+full-Fock rotated-mode one-body block encoding returned by
+`build_hermitian_one_body_block_encoding(...)` for each singles branch:
+`PREP_O^dag SELECT_O PREP_O` over retained one-body eigenmodes, using
+the same occupation-flag gadget as the Lemma-2 channel builder. This is
+the strongest literal realization currently available on the repo's
+gate/circuit model.
 
 For doubles, the repo now compiles each embedded channel
 `L_s = sigma_s B^dag[U_s] B[V_s]` through an explicit channel-local
@@ -136,9 +138,12 @@ issuing two ad hoc trig-specific fits at the generator layer.
 
 This is still a verification-scale scalar phase-synthesis utility
 rather than the paper's production complex QSP phase compiler: the
-available scalar solver works on real parity-valid targets, so the
-compiler records the direct complex target and then resolves it into
-real branches.
+current scalar circuit model exposes the ancilla-zero top-left
+polynomial of one Wx ladder, and that polynomial has definite parity.
+Since `exp(-i alpha x)` has both even and odd Chebyshev sectors, the
+compiler now records the direct complex target, explicitly marks one
+single ladder as infeasible on this model, and only then resolves the
+target into real parity-valid fallback branches.
 
 * Code anchor: `src/composer/qsp/phases.py`.
 
@@ -161,8 +166,10 @@ presentation: the repo currently realizes `e^{sigma}` as two parity
 compatible real QSP ladders (`cos`, `sin`) plus one final LCU. The gap
 is therefore narrower but not closed: the compiler now begins from the
 paper's direct complex target, but the resolved ladder synthesis still
-uses the structured parity split because the available scalar phase
-synthesis is restricted to bounded real polynomials of definite parity.
+uses the structured parity split because the current Wx/top-left model
+only admits definite-parity scalar ladders. Closing that remaining gap
+would require a more general direct complex/Laurent QSP phase
+factorization path than the repo currently implements.
 
 * Code anchor: `src/composer/qsp/chebyshev.py`.
 
@@ -205,7 +212,12 @@ structurally:
 The dense simulator still verifies these objects by synthesizing their
 matrices lazily, but the main circuit representation no longer stores
 the reusable oracle scaffold only as one dense PREP blob plus one dense
-SELECT blob.
+SELECT blob. In particular, the Theorem-1 Hamiltonian object now keeps
+the widened branch workspace in the compiled circuit and computes its
+paper-facing ancilla-zero system block directly from that circuit. The
+full dense `W_H` matrix is still available, but only as a lazy
+verification property rather than as an eagerly materialized part of
+the main scalable path.
 
 What is still deferred is the lower-level gate-set decomposition of
 those generic primitives themselves. PREP is still the small-system
@@ -377,6 +389,9 @@ The reporting contract is intentionally split:
   synthesis view over the actual structural circuit: ancilla count,
   recursive gate-family inventory, selector/control-state overhead, and
   dense-leaf counts.
+  It also returns `dense_leaf_gate_count_by_kind`, so the remaining
+  low-level dense leaves are named explicitly rather than hidden behind
+  one aggregate count.
 
 When the optional backend/export layer is installed, the same report API
 can also add a third view,
@@ -481,7 +496,11 @@ subcircuits/controlled operations. However, the exporter does not
 reinterpret opaque dense leaf primitives as new scalable synthesis
 algorithms. If a compiled COMPOSER leaf is still represented as a dense
 matrix, the adapter preserves that contract by emitting an exact SDK
-unitary instruction for that leaf.
+unitary instruction for that leaf. After the latest structural cleanup,
+the remaining leaves of that form are lower-level primitives such as
+full-register fermionic ladder gates, pair-reflection branches, and the
+exact full-unitary form of `StatePreparationGate`, not the old one-body
+or Cholesky branch wrappers.
 
 One subtle consequence is state preparation: COMPOSER's
 `StatePreparationGate` fixes a particular full verification unitary via

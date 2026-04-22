@@ -14,8 +14,12 @@ src/composer/block_encoding/lcu.py
 src/composer/block_encoding/similarity_sandwich.py
 src/composer/circuits/__init__.py
 src/composer/circuits/circuit.py
+src/composer/circuits/export.py
 src/composer/circuits/gate.py
+src/composer/circuits/resources.py
 src/composer/circuits/simulator.py
+src/composer/circuits/backends/__init__.py
+src/composer/circuits/backends/qiskit.py
 src/composer/diagnostics/__init__.py
 src/composer/diagnostics/mask_selection.py
 src/composer/diagnostics/mp2.py
@@ -51,6 +55,7 @@ tests/test_generator_exp.py
 tests/test_lcu.py
 tests/test_mp2_wauc.py
 tests/test_one_electron_ladder.py
+tests/test_qiskit_export.py
 tests/test_qsp.py
 tests/test_rank_one.py
 tests/test_similarity_sandwich.py

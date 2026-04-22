@@ -5,6 +5,116 @@ entries on top.
 
 ---
 
+## 2026-04-22 — Structural Hamiltonian ancilla width no longer forces eager dense full-unitary synthesis
+
+* Making the Theorem-1 Hamiltonian path structurally honest exposed one
+  last verification-model gap: the repo still formed
+  `circuit_unitary(build_hamiltonian_block_encoding(...).circuit)`
+  eagerly inside `build_hamiltonian_block_encoding(...)`. Once the
+  Cholesky branches stopped hiding behind one-ancilla dense wrappers,
+  that eager full-unitary synthesis became the true blocker for the
+  supported workflow rather than the structural circuit itself.
+* The fix was not to shrink the compiled circuit back down. Instead,
+  `src/composer/circuits/simulator.py` now exposes
+  `ancilla_zero_system_block(...)`, which extracts the paper-facing
+  ancilla-zero system block directly from a compiled circuit without
+  materializing the full `2^(n+a) x 2^(n+a)` unitary.
+* `src/composer/block_encoding/lcu.py` now stores that ancilla-zero
+  block eagerly and makes the full dense `W_H` matrix lazy. The
+  returned Theorem-1 object therefore keeps the honest widened ancilla
+  footprint in `circuit`/`resources`, while `top_left_block()` remains
+  cheap enough for the supported H2 workflow and the full dense matrix
+  is still available to small-system tests that explicitly ask for it.
+* `src/composer/block_encoding/similarity_sandwich.py` now reports
+  `encoded_system_block_dense` by extracting the ancilla-zero block of
+  the actual compiled outer sandwich circuit, instead of depending on a
+  separately materialized full dense Hamiltonian oracle matrix.
+* Added a regression in `tests/test_lcu.py` that fails if the Theorem-1
+  builder goes back to eagerly materializing the full compiled unitary
+  just to provide `top_left_block()`.
+* Closure validation after this fix showed the remaining supported-workflow
+  bottleneck more cleanly: the old Hamiltonian-memory failure is gone,
+  but the long pole is still repeated generator/QSP phase fitting and
+  its dense verification path (`tests/test_generator_exp.py`, the full
+  suite, and `examples/05_similarity_sandwich.py`).
+
+## 2026-04-22 — Opaque one-body and Cholesky branch wrappers removed from the main scalable path
+
+* Re-audited the remaining dense leaves in the paper-facing scalable
+  path after the QSP/parity work. Two avoidable shortcuts were still in
+  the main oracle flow:
+  the Hamiltonian LCU still wrapped each Lemma-2 Cholesky branch in one
+  dense `W_cholesky_squared` leaf, and the sigma oracle still wrapped
+  each singles branch in one dense `W_sigma_single` one-body wrapper.
+  Those were no longer justified because the repo already had enough
+  structure to express the rotated-mode PREP/SELECT/occupation-flag
+  construction directly.
+* `src/composer/block_encoding/cholesky_channel.py` now exposes an
+  explicit `build_hermitian_one_body_block_encoding(...)` builder for
+  the `O / Gamma` stage itself and keeps the degree-2 transform
+  structural as well: two `CircuitCall`s to the one-body block encoding
+  plus an explicit ancilla-projector gadget (`H`, `SelectGate`,
+  `AncillaZeroReflectionGate`, `H`) instead of one dense squaring
+  wrapper.
+* `src/composer/block_encoding/lcu.py` now reuses the structural
+  Lemma-2 circuits directly inside `SELECT_H`. This forced a real
+  resource-accounting correction: Hamiltonian branches no longer all fit
+  inside a fictitious one-ancilla workspace, so
+  `LCUResourceSummary.subencoding_ancilla` now reports the actual
+  maximum branch workspace width and the outer oracle ancilla count
+  grows accordingly on channels that retain index qubits.
+* `src/composer/block_encoding/generator_exp.py` now reuses the same
+  structural one-body builder for singles branches in `SELECT_sigma`.
+  Regressions back to opaque one-body wrappers are now caught by
+  `tests/test_generator_exp.py`, which checks that the recursive
+  dense-leaf report no longer contains `W_sigma_single` and instead
+  exposes the remaining low-level `Givens(...)` leaves explicitly.
+* `src/composer/circuits/resources.py` now reports
+  `dense_leaf_gate_count_by_kind` in addition to the aggregate dense
+  leaf count. This makes the final unavoidable leaves explicit in both
+  code and docs: after the wrapper cleanup, the main remaining dense
+  primitives are low-level full-register fermionic ladder gates,
+  `PAIR_branch_reflection`, and exact exported state-preparation
+  unitaries in the optional backend path.
+* Added/updated focused regressions:
+  `tests/test_cholesky_channel_be.py` now locks in that the stored
+  one-body and degree-2 matrices match the structural circuits;
+  `tests/test_lcu.py` now asserts that the recursive report no longer
+  contains `W_cholesky_squared` and that the widened branch workspace is
+  surfaced honestly;
+  `tests/test_qiskit_export.py` now exports the shipped H2 LCU and
+  fails if the optional backend path collapses that compiled oracle into
+  one top-level dense SDK unitary.
+
+## 2026-04-21 — Foundation dependency audit no longer misclassifies stdlib extension modules
+
+* Re-audited the remaining repo-hygiene closure issue in
+  `tests/test_foundation.py`. The dependency audit was still too
+  shallow when `sys.stdlib_module_names` was unavailable: it listed only
+  builtins plus top-level modules under `sysconfig.get_path("stdlib")`,
+  which misses extension modules living under stdlib `lib-dynload`.
+  That could incorrectly classify stdlib imports such as `cmath`
+  (currently used by the optional Qiskit backend) as third-party
+  dependencies.
+* `tests/test_foundation.py` now keeps the strong audit but changes the
+  classifier: on Python `3.10+` it trusts `sys.stdlib_module_names`,
+  and otherwise it resolves each import root through
+  `importlib.util.find_spec(...)` and checks that the discovered module
+  origin lives under stdlib/platstdlib roots or `DESTSHARED` while
+  explicitly excluding `purelib` / `platlib` (`site-packages`).
+  This preserves the audit's value instead of weakening it into a broad
+  allowlist.
+* Added a focused regression check that `cmath` is recognized as stdlib,
+  so the foundation suite fails if extension-module detection regresses
+  again.
+* Updated `README.md` to describe that version-specific dependency-audit
+  behavior accurately while leaving the supported workflow unchanged:
+  the honest contract is still an activated Python `3.10+` editable
+  install plus `python -m pytest`.
+* Re-ran the relevant foundation suite in the supported environment:
+  `./.venv-supported/bin/python -m pytest tests/test_foundation.py -q`
+  passed cleanly.
+
 ## 2026-04-21 — Resource-estimation views now separate logical summaries, compiled synthesis overhead, and optional backend counts
 
 * Audited the current closure state against the scoped "final scalable
@@ -102,7 +212,7 @@ entries on top.
   those leaves visible to real SDK tooling, but it does not yet replace
   those leaf matrices with new gate-by-gate scalable constructions.
 
-## 2026-04-21 — Generator-exp phase compilation now starts from the direct complex target
+## 2026-04-21 — Generator-exp phase compilation now requests the direct complex path first and records why one ladder still fails on the current model
 
 * Re-audited Sec. IV.B Eq. (44)-(46) and Appendix C against the current
   `qsp/{chebyshev,phases}.py` and `block_encoding/generator_exp.py`
@@ -122,15 +232,25 @@ entries on top.
   resource summary now expose the resolved compilation strategy,
   whether a single ladder was used, and the direct complex truncation
   degree used to anchor the schedule.
+* The direct complex request is now explicit rather than implied:
+  `build_generator_exp_oracle(...)` asks for a direct complex
+  single-ladder compile first, while `qsp/phases.py` records why that
+  request still falls back on the current repo scope. The narrow reason
+  is no longer documented merely as "the scalar solver is real-only":
+  on the current Wx/top-left circuit model, one ladder can only realize
+  a definite-parity scalar polynomial, whereas `exp(-i alpha x)` has
+  both even and odd Chebyshev sectors.
 * The resolved implementation remains truthful about the remaining gap:
   the repo still synthesizes `e^{sigma}` through the structured
-  parity-split `cos` / `sin` fallback plus LCU, because a full direct
-  complex single-ladder phase compiler is not yet implemented on top of
-  the current scalar Wx solver.
+  parity-split `cos` / `sin` fallback plus LCU, but those fallback
+  branch targets are now derived directly from the complex Jacobi-Anger
+  coefficients rather than being treated as the primary compile inputs.
 * `tests/test_qsp.py` now checks the compiled Chebyshev-target metadata
-  and the direct-complex-target schedule bookkeeping, while
+  plus the parity-based infeasibility bookkeeping for one direct ladder,
+  while
   `tests/test_generator_exp.py` now locks in that the generator oracle
-  consumes the compiled schedule object rather than two ad hoc
+  requests the direct complex schedule first and only then consumes the
+  explicit parity-split fallback object rather than two ad hoc
   trig-specific fits.
 
 ## 2026-04-21 — Reusable oracle primitives moved from dense wrappers to structural circuit objects

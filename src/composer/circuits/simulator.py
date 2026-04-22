@@ -39,6 +39,7 @@ from .circuit import Circuit
 from .gate import AncillaZeroReflectionGate, CircuitOp
 
 __all__ = [
+    "ancilla_zero_system_block",
     "apply_gate_to_statevector",
     "apply_gate_to_unitary",
     "statevector",
@@ -142,3 +143,27 @@ def embed_gate(gate: CircuitOp, n_qubits: int) -> np.ndarray:
     c = Circuit(num_qubits=n_qubits)
     c.append(gate)
     return unitary(c)
+
+
+def ancilla_zero_system_block(circuit: Circuit, *, system_width: int) -> np.ndarray:
+    """Return the ancilla-zero system block without forming the full unitary.
+
+    The circuit is assumed to use the repo's standard layout: system
+    qubits occupy the least-significant positions and ancillas the
+    remaining most-significant positions.
+    """
+    if system_width < 0 or system_width > circuit.num_qubits:
+        raise ValueError(
+            f"system_width must lie in [0, {circuit.num_qubits}], got {system_width}"
+        )
+    n = circuit.num_qubits
+    dim = 2**n
+    dim_sys = 2**system_width
+    block = np.empty((dim_sys, dim_sys), dtype=complex)
+    for col in range(dim_sys):
+        state = np.zeros(dim, dtype=complex)
+        state[col] = 1.0
+        for gate in circuit.gates:
+            state = apply_gate_to_statevector(state, gate, n)
+        block[:, col] = state[:dim_sys]
+    return block

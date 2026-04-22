@@ -76,6 +76,23 @@ def test_lcu_alpha_is_sum_of_absolute_weights():
     assert np.isclose(be.alpha, np.sum(np.abs(be.weights)), atol=1e-10)
 
 
+def test_lcu_top_left_block_is_available_without_materializing_full_unitary():
+    rng = np.random.default_rng(21)
+    n = 3
+    h = 0.1 * rng.normal(size=(n, n))
+    h = 0.5 * (h + h.T)
+    eri = _random_real_symmetric_eri(n, K=2, rng=rng)
+    pool = build_pool_from_integrals(h, eri)
+
+    be = build_hamiltonian_block_encoding(pool)
+    assert be._W_dense is None
+
+    block = be.top_left_block()
+
+    assert be._W_dense is None
+    assert np.allclose(be.alpha * block, pool.dense_matrix(), atol=1e-8)
+
+
 def test_lcu_resources_match_compiled_circuit_and_branch_accounting():
     rng = np.random.default_rng(12)
     n = 3
@@ -91,7 +108,12 @@ def test_lcu_resources_match_compiled_circuit_and_branch_accounting():
     assert resources.n_system == pool.n_orbitals
     assert resources.n_ancilla == be.n_ancilla
     assert resources.selector_width == be.selector_width
-    assert resources.subencoding_ancilla == 1
+    top_select = be.circuit.gates[1]
+    assert isinstance(top_select, MultiplexedGate)
+    assert resources.subencoding_ancilla == max(
+        branch.num_qubits - be.n_system for branch in top_select.branch_circuits
+    )
+    assert resources.subencoding_ancilla > 1
     assert resources.active_branch_count == len(be.weights)
     assert resources.compiled_branch_count == len(be.weights) + 1
     assert resources.null_branch_index == len(be.weights)
@@ -119,12 +141,13 @@ def test_lcu_resource_report_exposes_ancilla_and_selector_overhead():
 
     assert report.compiled.ancilla_qubits == be.n_ancilla
     assert report.compiled.logical_summary == be.resources.circuit
-    assert report.compiled.selector_control.multiplexed_gate_count == 1
-    assert report.compiled.selector_control.select_gate_count == 0
+    assert report.compiled.selector_control.multiplexed_gate_count > 1
+    assert report.compiled.selector_control.select_gate_count > 0
     assert report.compiled.selector_control.max_selector_width == be.selector_width
-    assert report.compiled.selector_control.compiled_selector_state_count == 2**be.selector_width
+    assert report.compiled.selector_control.compiled_selector_state_count >= 2**be.selector_width
     assert report.compiled.expanded_gate_count > report.logical.gate_count
     assert report.compiled.dense_leaf_gate_count > 0
+    assert "W_cholesky_squared" not in report.compiled.dense_leaf_gate_count_by_kind
 
 
 def test_lcu_zero_hamiltonian_gives_empty_encoding():

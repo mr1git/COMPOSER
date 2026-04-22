@@ -511,8 +511,12 @@ def test_generator_exp_oracle_is_built_from_reusable_compiled_subcircuits():
     sigma_oracle = build_sigma_pool_oracle(gen, mask)
     exp_oracle = build_generator_exp_oracle(sigma_oracle, eps=2e-2, qsp_max_iter=600)
 
-    assert exp_oracle.phase_schedule.resolved_strategy == "parity_split_chebyshev"
+    assert exp_oracle.phase_schedule.requested_strategy == "direct_complex"
+    assert exp_oracle.phase_schedule.resolved_strategy == "parity_split_due_mixed_parity"
     assert exp_oracle.phase_schedule.uses_single_ladder is False
+    assert exp_oracle.phase_schedule.direct_complex_supported is False
+    assert exp_oracle.phase_schedule.fallback_reason is not None
+    assert "definite parity" in exp_oracle.phase_schedule.fallback_reason
     assert np.allclose(exp_oracle.phase_schedule.cos_sequence.phases, exp_oracle.cos_phases, atol=1e-12)
     assert np.allclose(exp_oracle.phase_schedule.sin_sequence.phases, exp_oracle.sin_phases, atol=1e-12)
 
@@ -544,6 +548,24 @@ def test_generator_exp_oracle_is_built_from_reusable_compiled_subcircuits():
 
     assert isinstance(exp_oracle.unitary_circuit.gates[1], AncillaZeroReflectionGate)
     assert isinstance(exp_oracle.unitary_circuit.gates[3], AncillaZeroReflectionGate)
+
+
+def test_sigma_oracle_resource_report_exposes_structural_one_body_leaves():
+    NO = NV = 2
+    t1 = np.array([[0.08, 0.0], [0.0, -0.03j]], dtype=complex)
+    t2 = np.zeros((NV, NV, NO, NO), dtype=complex)
+    t2[0, 1, 0, 1] = 0.02
+    t2[1, 0, 0, 1] = -0.02
+    t2[0, 1, 1, 0] = -0.02
+    t2[1, 0, 1, 0] = 0.02
+    gen = build_cluster_generator(NO, NV, t1=t1, t2=t2)
+    sigma_oracle = build_sigma_pool_oracle(gen, uniform_mask(len(gen.generator_channels())))
+
+    report = sigma_oracle.circuit.resource_report(system_width=sigma_oracle.n_system)
+
+    assert "W_sigma_single" not in report.compiled.dense_leaf_gate_count_by_kind
+    assert any(kind.startswith("Givens(") for kind in report.compiled.dense_leaf_gate_count_by_kind)
+    assert report.compiled.selector_control.multiplexed_gate_count >= 2
 
 
 def test_generator_exp_oracle_reuses_qsp_phase_lists_across_mask_updates():
@@ -579,6 +601,7 @@ def test_generator_exp_oracle_reuses_qsp_phase_lists_across_mask_updates():
     assert exp_a.cos_degree == exp_b.cos_degree
     assert exp_a.sin_degree == exp_b.sin_degree
     assert exp_a.phase_schedule.complex_degree == exp_b.phase_schedule.complex_degree
+    assert exp_a.phase_schedule.requested_strategy == exp_b.phase_schedule.requested_strategy == "direct_complex"
     assert exp_a.phase_schedule.resolved_strategy == exp_b.phase_schedule.resolved_strategy
     assert np.allclose(exp_a.cos_phases, exp_b.cos_phases, atol=1e-12)
     assert np.allclose(exp_a.sin_phases, exp_b.sin_phases, atol=1e-12)

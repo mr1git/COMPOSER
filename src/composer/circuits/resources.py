@@ -54,6 +54,7 @@ class CompiledCircuitResourceEstimate:
     expanded_gate_count: int
     expanded_gate_count_by_kind: dict[str, int]
     dense_leaf_gate_count: int
+    dense_leaf_gate_count_by_kind: dict[str, int]
     structural_gate_count: int
     max_expanded_gate_arity: int
     selector_control: SelectorControlSummary
@@ -91,6 +92,7 @@ class CircuitResourceReport:
 class _CompiledAccumulator:
     gate_count_by_kind: Counter[str]
     dense_leaf_gate_count: int = 0
+    dense_leaf_gate_count_by_kind: Counter[str] = None  # type: ignore[assignment]
     structural_gate_count: int = 0
     max_gate_arity: int = 0
     select_gate_count: int = 0
@@ -103,6 +105,8 @@ class _CompiledAccumulator:
     selector_width_histogram: Counter[int] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        if self.dense_leaf_gate_count_by_kind is None:
+            self.dense_leaf_gate_count_by_kind = Counter()
         if self.selector_width_histogram is None:
             self.selector_width_histogram = Counter()
 
@@ -110,6 +114,7 @@ class _CompiledAccumulator:
 def _merge_accumulator(target: _CompiledAccumulator, source: _CompiledAccumulator) -> None:
     target.gate_count_by_kind.update(source.gate_count_by_kind)
     target.dense_leaf_gate_count += source.dense_leaf_gate_count
+    target.dense_leaf_gate_count_by_kind.update(source.dense_leaf_gate_count_by_kind)
     target.structural_gate_count += source.structural_gate_count
     target.max_gate_arity = max(target.max_gate_arity, source.max_gate_arity)
     target.select_gate_count += source.select_gate_count
@@ -154,6 +159,7 @@ def _summarize_compiled_subtree(
             accumulator.max_gate_arity = max(accumulator.max_gate_arity, op.num_qubits)
             if isinstance(op, Gate):
                 accumulator.dense_leaf_gate_count += 1
+                accumulator.dense_leaf_gate_count_by_kind[kind] += 1
                 continue
 
             accumulator.structural_gate_count += 1
@@ -252,6 +258,7 @@ def _compiled_resource_estimate(
         expanded_gate_count=sum(accumulator.gate_count_by_kind.values()),
         expanded_gate_count_by_kind=dict(sorted(accumulator.gate_count_by_kind.items())),
         dense_leaf_gate_count=accumulator.dense_leaf_gate_count,
+        dense_leaf_gate_count_by_kind=dict(sorted(accumulator.dense_leaf_gate_count_by_kind.items())),
         structural_gate_count=accumulator.structural_gate_count,
         max_expanded_gate_arity=accumulator.max_gate_arity,
         selector_control=SelectorControlSummary(

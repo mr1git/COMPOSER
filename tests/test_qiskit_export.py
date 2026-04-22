@@ -1,8 +1,11 @@
 """Optional Qiskit export checks for compiled COMPOSER circuits."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
+from composer.block_encoding.lcu import build_hamiltonian_block_encoding
 from composer.circuits.circuit import Circuit
 from composer.circuits.export import qiskit_available, to_qiskit
 from composer.circuits.gate import (
@@ -13,10 +16,11 @@ from composer.circuits.gate import (
     SelectGate,
     StatePreparationGate,
 )
-from composer.circuits.simulator import unitary
+from composer.circuits.simulator import statevector, unitary
+from composer.operators.hamiltonian import build_pool_from_integrals
 
 if qiskit_available():
-    from qiskit.quantum_info import Operator
+    from qiskit.quantum_info import Operator, Statevector
 
     def _x_gate() -> np.ndarray:
         return np.array([[0, 1], [1, 0]], dtype=complex)
@@ -176,3 +180,35 @@ if qiskit_available():
         assert report.backend.two_qubit_count > 0
         assert report.backend.transpiled_gate_family_counts is not None
         assert "cx" in report.backend.transpiled_gate_family_counts
+
+
+    def test_qiskit_export_of_h2_lcu_preserves_compiled_structure():
+        data = np.load(Path(__file__).resolve().parents[1] / "data" / "h2_sto3g_integrals.npz")
+        block_encoding = build_hamiltonian_block_encoding(
+            build_pool_from_integrals(data["h"], data["eri"])
+        )
+
+        exported = to_qiskit(block_encoding.circuit, preserve_hierarchy=False)
+        n_qubits = block_encoding.circuit.num_qubits
+        dim = 2**n_qubits
+
+        assert len(exported.data) > 1
+        assert not (
+            len(exported.data) == 1
+            and exported.data[0].operation.name == "unitary"
+            and len(exported.data[0].qubits) == exported.num_qubits
+        )
+        assert exported.metadata["composer_compiled_signature_hash"] == block_encoding.circuit.compiled_signature_hash()
+
+        basis_zero = np.zeros(dim, dtype=complex)
+        basis_zero[0] = 1.0
+        basis_edge = np.zeros(dim, dtype=complex)
+        basis_edge[-1] = 1.0
+        rng = np.random.default_rng(0)
+        random_state = rng.normal(size=dim) + 1j * rng.normal(size=dim)
+        random_state = random_state / np.linalg.norm(random_state)
+
+        for init in (basis_zero, basis_edge, random_state):
+            composer_out = statevector(block_encoding.circuit, init=init)
+            qiskit_out = Statevector(init).evolve(exported).data
+            assert np.allclose(qiskit_out, composer_out, atol=1e-10)

@@ -11,6 +11,12 @@ Two degree-2 views are kept side-by-side:
   Hadamard-sandwiched reflection gadget. This is a constant-overhead
   exact degree-2 transform on the encoded operator.
 
+The scalar Wx helpers elsewhere in ``composer.qsp`` continue to work in
+the definite-parity top-left-polynomial regime. That parity restriction
+is exactly why the generator-exponential path must resolve the paper's
+mixed-parity complex target into an explicit fallback on the current
+repo scope.
+
 Derivation of the ``x^2`` phases (Wx convention)
 -------------------------------------------------
 

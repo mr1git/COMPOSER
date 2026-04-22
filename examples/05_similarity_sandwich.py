@@ -110,6 +110,7 @@ def main() -> None:
         "Nested compiled synthesis view: "
         f"ancilla={compiled_report.compiled.ancilla_qubits}, "
         f"expanded gate kinds={compiled_report.compiled.expanded_gate_count_by_kind}, "
+        f"dense leaf kinds={compiled_report.compiled.dense_leaf_gate_count_by_kind}, "
         f"selector states={compiled_report.compiled.selector_control.compiled_selector_state_count}, "
         f"max selector width={compiled_report.compiled.selector_control.max_selector_width}"
     )

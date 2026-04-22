@@ -21,8 +21,9 @@ For ``e^{σ̂}``, the main path now consumes that real oracle instead of
 applying a Chebyshev polynomial directly to a dense matrix. The phase
 compiler is now driven by the direct Appendix-C complex target
 ``exp(-i alpha x)`` and only then resolved into the structured fallback
-that the current scalar solver can synthesize. Concretely, the
-implemented exponential is assembled as:
+forced by the current Wx/top-left scalar model: a single ladder can only
+carry one definite parity, while the exponential target has both.
+Concretely, the implemented exponential is assembled as:
 
 * one compiled exponential phase schedule rooted in the direct complex
   Jacobi-Anger series,
@@ -37,8 +38,10 @@ This keeps the implementation materially closer to the paper's
 oracle/QSP construction than the old dense surrogate, while the dense
 Chebyshev path is retained as an optional numerical reference for
 direct dense-matrix input. A fully direct single complex ladder remains
-deferred; the resolved compilation strategy is tracked explicitly in
-the returned phase schedule.
+deferred only because the current scalar circuit model exposes the
+ancilla-zero top-left polynomial of one Wx ladder, which is parity
+definite by construction; the resolved compilation strategy and
+fallback reason are tracked explicitly in the returned phase schedule.
 """
 from __future__ import annotations
 
@@ -71,7 +74,7 @@ from ..qsp.phases import (
 )
 from ..utils import fermion as jw
 from ..utils.antisymmetric import index_to_pair, pairs_from_matrix
-from .cholesky_channel import hermitian_one_body_block_encoding
+from .cholesky_channel import build_hermitian_one_body_block_encoding
 
 __all__ = [
     "SigmaOracleResourceSummary",
@@ -194,7 +197,7 @@ class GeneratorExpOracle:
 
     ``phase_schedule`` records how the paper's direct complex target was
     compiled. On the current repo scope it resolves to a structured
-    parity split, so ``circuit`` is the direct parity-split block encoding whose
+    parity split forced by the current Wx/top-left model, so ``circuit`` is the direct parity-split block encoding whose
     ancilla-zero block equals
 
         ``exp(sign * sigma_hat) / 2``.
@@ -317,16 +320,11 @@ def _single_channel_hermitian_subencoding(
     n_system: int,
 ) -> tuple[Circuit, float]:
     """Full-Fock block encoding of a Hermitian one-body singles generator term."""
-    W, alpha = hermitian_one_body_block_encoding(
+    be = build_hermitian_one_body_block_encoding(
         channel.hermitian_generator_matrix(),
         n_qubits=n_system,
     )
-    return _dense_subcircuit(
-        name="W_sigma_single",
-        unitary=W,
-        width=n_system + 1,
-        kind="W_sigma_single",
-    ), alpha
+    return be.circuit, be.alpha
 
 
 def _reflection_block_encoding(H: np.ndarray) -> np.ndarray:
@@ -558,7 +556,7 @@ def build_sigma_pool_oracle(
         if isinstance(channel, SingleExcitationChannel):
             branch_circuit, alpha_s = _single_channel_hermitian_subencoding(channel, n_system=n)
             channel_subencoding_kinds.append("single")
-            branch_ancilla_widths.append(1)
+            branch_ancilla_widths.append(branch_circuit.num_qubits - n)
         else:
             adaptor = build_doubles_channel_adaptor(channel, n_system=n, tol=tol)
             branch_circuit = adaptor.circuit
@@ -896,7 +894,7 @@ def _compiled_exponential_phase_schedule(
     return compile_exponential_qsp_schedule(
         alpha,
         eps,
-        strategy="auto",
+        strategy="direct_complex",
         n_grid=n_grid,
         max_iter=max_iter,
         rng_seed=0,

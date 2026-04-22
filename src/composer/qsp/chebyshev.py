@@ -1,4 +1,4 @@
-"""Chebyshev expansions of ``e^{-i alpha x}`` and its real/imag parts.
+"""Chebyshev expansions of ``e^{-i alpha x}`` and its parity components.
 
 Implements the Jacobi-Anger expansion
 
@@ -18,12 +18,13 @@ which is sufficient for a uniform truncation error ``eps`` on ``[-1, 1]``
 
 Used by ``qsp/phases.py`` and ``block_encoding/generator_exp.py`` as
 the scalar source for the generator-exponential phase compiler. The
-compiler now anchors itself to the direct complex Jacobi-Anger target
-``exp(-i alpha x)`` and then, on the current repo scope, resolves that
-target into the parity-valid ``cos(alpha x)`` / ``sin(alpha x)``
-branches that the scalar phase solver can synthesize. The retained
-dense Chebyshev evaluation is a reference helper only; it is not the
-main construction path for ``build_generator_exp_oracle(...)``.
+compiler now treats the direct complex Jacobi-Anger target
+``exp(-i alpha x)`` as primary, then splits that target into its even
+and odd Chebyshev sectors only because the current repo's single-ladder
+Wx/top-left model can realize only definite-parity scalar polynomials.
+The retained dense Chebyshev evaluation is a reference helper only; it
+is not the main construction path for
+``build_generator_exp_oracle(...)``.
 """
 from __future__ import annotations
 
@@ -32,15 +33,56 @@ from numpy.polynomial import chebyshev as _cheb
 from scipy.special import jv
 
 __all__ = [
+    "chebyshev_parity",
     "recommended_degree",
     "recommended_degree_with_parity",
     "jacobi_anger_coefficients",
     "cos_alpha_x_coefficients",
     "sin_alpha_x_coefficients",
+    "split_chebyshev_by_parity",
+    "split_exponential_chebyshev_components",
+    "trim_chebyshev_coefficients",
     "chebyshev_to_monomial",
     "truncation_error_bound",
     "evaluate_chebyshev",
 ]
+
+
+def trim_chebyshev_coefficients(coeffs: np.ndarray, *, atol: float = 1e-14) -> np.ndarray:
+    """Drop trailing near-zero Chebyshev coefficients."""
+    coeffs = np.asarray(coeffs)
+    if coeffs.ndim != 1:
+        raise ValueError("coeffs must be one-dimensional")
+    last = coeffs.shape[0] - 1
+    while last > 0 and abs(coeffs[last]) <= atol:
+        last -= 1
+    return coeffs[: last + 1].copy()
+
+
+def split_chebyshev_by_parity(coeffs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the even- and odd-index Chebyshev sectors of ``coeffs``."""
+    coeffs = np.asarray(coeffs)
+    if coeffs.ndim != 1:
+        raise ValueError("coeffs must be one-dimensional")
+    even = np.zeros_like(coeffs)
+    odd = np.zeros_like(coeffs)
+    even[::2] = coeffs[::2]
+    odd[1::2] = coeffs[1::2]
+    return even, odd
+
+
+def chebyshev_parity(coeffs: np.ndarray, *, atol: float = 1e-12) -> int | None:
+    """Return the definite parity of ``coeffs`` or ``None`` if mixed."""
+    even, odd = split_chebyshev_by_parity(coeffs)
+    has_even = np.any(np.abs(even) > atol)
+    has_odd = np.any(np.abs(odd) > atol)
+    if has_even and has_odd:
+        return None
+    if has_even:
+        return 0
+    if has_odd:
+        return 1
+    return 0
 
 
 def recommended_degree(alpha: float, eps: float) -> int:
@@ -99,6 +141,29 @@ def sin_alpha_x_coefficients(alpha: float, degree: int) -> np.ndarray:
     """
     coeffs = -jacobi_anger_coefficients(alpha, degree).imag
     return coeffs
+
+
+def split_exponential_chebyshev_components(
+    complex_coeffs: np.ndarray,
+    *,
+    atol: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Derive ``cos(alpha x)`` and ``sin(alpha x)`` branches from ``exp(-i alpha x)``.
+
+    The returned arrays are real Chebyshev coefficients trimmed to their
+    natural parity-valid degrees. This keeps the structured fallback
+    rooted in the direct complex target rather than recompiling the real
+    branches independently.
+    """
+    complex_coeffs = np.asarray(complex_coeffs, dtype=complex).ravel()
+    even, odd = split_chebyshev_by_parity(complex_coeffs)
+    if np.max(np.abs(even.imag), initial=0.0) > atol:
+        raise ValueError("even Chebyshev sector of exp(-i alpha x) should be real")
+    if np.max(np.abs(odd.real), initial=0.0) > atol:
+        raise ValueError("odd Chebyshev sector of exp(-i alpha x) should be purely imaginary")
+    cos_coeffs = trim_chebyshev_coefficients(even.real, atol=atol)
+    sin_coeffs = trim_chebyshev_coefficients((1j * odd).real, atol=atol)
+    return cos_coeffs, sin_coeffs
 
 
 def truncation_error_bound(alpha: float, degree: int) -> float:
